@@ -56,7 +56,7 @@ Modules access siblings through typed protected methods: `mq_()`, `configuration
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `POPFILE_USER_DIR` | `./` | Working directory for db, logs, messages |
-| `POPFILE_POP3_PORT` | `110` | POP3 proxy listen port |
+| `POPFILE_POP3_PORT` | `1110` | POP3 proxy listen port |
 | `POPFILE_UI_PORT` | `8080` | Web UI listen port |
 
 ### Not yet ported

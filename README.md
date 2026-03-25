@@ -86,10 +86,10 @@ registration), `RELSE` (session released).
 ### Run the full server
 
 ```bash
-deno run --allow-net --allow-read --allow-write --allow-env src/main.ts
+deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi src/main.ts
 ```
 
-The POP3 proxy starts on port **110** (or `POPFILE_POP3_PORT`).  
+The POP3 proxy starts on port **1110** (or `POPFILE_POP3_PORT`).
 The web UI starts on **http://127.0.0.1:8080** (or `POPFILE_UI_PORT`).
 
 ### Environment variables
@@ -97,13 +97,13 @@ The web UI starts on **http://127.0.0.1:8080** (or `POPFILE_UI_PORT`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `POPFILE_USER_DIR` | `./` | Working directory for db, logs, messages |
-| `POPFILE_POP3_PORT` | `110` | POP3 proxy listen port |
+| `POPFILE_POP3_PORT` | `1110` | POP3 proxy listen port |
 | `POPFILE_UI_PORT` | `8080` | Web UI listen port |
 
 ### Classify a message from the CLI
 
 ```bash
-deno run --allow-net --allow-read --allow-write --allow-env \
+deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi \
   src/classify.ts /path/to/message.eml
 ```
 

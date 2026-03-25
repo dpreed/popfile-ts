@@ -29,7 +29,7 @@ export class POP3Proxy extends Module {
   }
 
   override initialize(): LifecycleResult {
-    this.config_("port", "110");
+    this.config_("port", "1110");
     this.config_("secure", "0");
     this.config_("local", "1");
     this.config_("separator", ":");
