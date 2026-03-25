@@ -33,17 +33,20 @@ export class MailParser {
 
   /** Parse a complete RFC 2822 message from a string. */
   parse(rawMessage: string, cutoff = 100_000): ParseResult {
-    const limited = rawMessage.slice(0, cutoff);
-    const { headers, body } = this.#splitHeadersBody(limited);
+    const { headers, body } = this.#splitHeadersBody(rawMessage);
     const contentType = headers.get("content-type") ?? "text/plain";
     const encoding = headers.get("content-transfer-encoding") ?? "7bit";
 
     const words: Map<string, number> = new Map();
     // Include headers in classification (From, Subject, etc.)
     this.#addWords(words, this.#extractHeaderText(headers));
-    // Parse the body recursively
+    // Parse the body recursively, then apply cutoff at a word boundary so
+    // truncation never creates spurious partial-word tokens.
     const bodyText = this.#decodeBody(body, contentType, encoding, headers);
-    this.#addWords(words, bodyText);
+    const limited = bodyText.length > cutoff
+      ? bodyText.slice(0, cutoff).replace(/\S+$/, "")
+      : bodyText;
+    this.#addWords(words, limited);
 
     return { words, headers };
   }
