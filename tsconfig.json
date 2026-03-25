@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"],
+    "typeRoots": ["./stubs"],
+    "paths": {
+      "@db/sqlite": ["./stubs/sqlite.d.ts"],
+      "@std/path": ["./stubs/path.d.ts"],
+      "@std/encoding/hex": ["./stubs/hex.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "stubs/**/*.d.ts"],
+  "exclude": ["src/tests/**"]
+}
