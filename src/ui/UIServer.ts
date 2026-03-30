@@ -14,9 +14,12 @@
  *   POST /magnets/delete       → delete a magnet
  *   GET  /classify             → classify form
  *   POST /classify             → classify a message file
+ *   GET  /train                → train form
+ *   POST /train                → train a message file into a bucket
  *   GET  /history              → recent classification history
  *   GET  /api/buckets          → JSON bucket list
  *   GET  /api/classify?file=   → JSON classify result
+ *   POST /api/train            → JSON train endpoint
  */
 
 import { Module, LifecycleResult } from "../core/Module.ts";
@@ -72,6 +75,7 @@ export class UIServer extends Module {
       // API routes (JSON)
       if (path === "/api/buckets") return this.#apiBuckets(bayes);
       if (path === "/api/classify") return await this.#apiClassify(url, bayes);
+      if (path === "/api/train" && req.method === "POST") return await this.#apiTrain(req, bayes);
 
       // HTML routes
       if (path === "/" || path === "") return Response.redirect(new URL("/buckets", req.url));
@@ -81,8 +85,10 @@ export class UIServer extends Module {
       if (path === "/magnets" && req.method === "GET") return this.#pageMagnets(bayes);
       if (path === "/magnets/add" && req.method === "POST") return await this.#addMagnet(req, bayes);
       if (path === "/magnets/delete" && req.method === "POST") return await this.#deleteMagnet(req, bayes);
-      if (path === "/classify" && req.method === "GET") return this.#pageClassify();
+      if (path === "/classify" && req.method === "GET") return this.#pageClassify(bayes);
       if (path === "/classify" && req.method === "POST") return await this.#doClassify(req, bayes);
+      if (path === "/train" && req.method === "GET") return this.#pageTrain(bayes);
+      if (path === "/train" && req.method === "POST") return await this.#doTrain(req, bayes);
 
       return this.#html404();
     } catch (e) {
@@ -102,6 +108,19 @@ export class UIServer extends Module {
       wordCount: bayes.getBucketWordCount(this.#session, name),
     }));
     return Response.json(data);
+  }
+
+  async #apiTrain(req: Request, bayes: Bayes): Promise<Response> {
+    const { file, bucket } = await req.json();
+    if (!file || !bucket) return Response.json({ error: "Missing file or bucket" }, { status: 400 });
+    try {
+      const { MailParser } = await import("../classifier/MailParser.ts");
+      const parsed = new MailParser().parseFile(file);
+      bayes.trainMessage(this.#session, bucket, parsed);
+      return Response.json({ ok: true, file, bucket });
+    } catch (e) {
+      return Response.json({ error: String(e) }, { status: 400 });
+    }
   }
 
   async #apiClassify(url: URL, bayes: Bayes): Promise<Response> {
@@ -219,7 +238,7 @@ export class UIServer extends Module {
     return Response.redirect(new URL("/magnets", req.url), 303);
   }
 
-  #pageClassify(): Response {
+  #pageClassify(bayes: Bayes): Response {
     const body = `
       <h2>Classify a message</h2>
       <form method="POST" action="/classify">
@@ -235,6 +254,7 @@ export class UIServer extends Module {
   async #doClassify(req: Request, bayes: Bayes): Promise<Response> {
     const form = await req.formData();
     const file = (form.get("file") as string)?.trim();
+    const buckets = bayes.getBuckets(this.#session);
     let resultHtml = "";
     if (file) {
       try {
@@ -242,6 +262,9 @@ export class UIServer extends Module {
         const scoreRows = [...result.scores.entries()]
           .sort((a, b) => b[1] - a[1])
           .map(([b, s]) => `<tr><td>${esc(b)}</td><td>${(s * 100).toFixed(4)}%</td></tr>`)
+          .join("");
+        const bucketOptions = buckets
+          .map((b) => `<option value="${esc(b)}"${b === result.bucket ? " selected" : ""}>${esc(b)}</option>`)
           .join("");
         resultHtml = `
           <div class="result">
@@ -252,6 +275,15 @@ export class UIServer extends Module {
               <thead><tr><th>Bucket</th><th>Score</th></tr></thead>
               <tbody>${scoreRows}</tbody>
             </table>
+            ${buckets.length > 0 ? `
+            <div class="train-correction">
+              <p>Was this wrong? Train as:</p>
+              <form method="POST" action="/train" class="inline-form">
+                <input type="hidden" name="file" value="${esc(file)}">
+                <select name="bucket">${bucketOptions}</select>
+                <button class="btn-primary">Train</button>
+              </form>
+            </div>` : ""}
           </div>`;
       } catch (e) {
         resultHtml = `<div class="error">Error: ${esc(String(e))}</div>`;
@@ -269,6 +301,59 @@ export class UIServer extends Module {
     return this.#htmlPage("Classify", body);
   }
 
+  #pageTrain(bayes: Bayes, message?: string): Response {
+    const buckets = bayes.getBuckets(this.#session);
+    const bucketOptions = buckets.map((b) => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
+    const body = `
+      <h2>Train a message</h2>
+      <p>Teach the classifier the correct bucket for a message file.</p>
+      ${message ? `<div class="success">${esc(message)}</div>` : ""}
+      <form method="POST" action="/train">
+        <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
+          <label>Path to .eml file on server:
+            <input type="text" name="file" placeholder="/path/to/message.eml" required style="width:100%">
+          </label>
+          <label>Bucket:
+            <select name="bucket" style="width:100%">${bucketOptions}</select>
+          </label>
+          <button class="btn-primary" style="align-self:flex-start">Train</button>
+        </div>
+      </form>`;
+    return this.#htmlPage("Train", body);
+  }
+
+  async #doTrain(req: Request, bayes: Bayes): Promise<Response> {
+    const form = await req.formData();
+    const file = (form.get("file") as string)?.trim();
+    const bucket = (form.get("bucket") as string)?.trim();
+    if (!file || !bucket) return this.#pageTrain(bayes);
+    try {
+      const { MailParser } = await import("../classifier/MailParser.ts");
+      const parsed = new MailParser().parseFile(file);
+      bayes.trainMessage(this.#session, bucket, parsed);
+      return this.#pageTrain(bayes, `Trained "${file}" as "${bucket}".`);
+    } catch (e) {
+      const buckets = bayes.getBuckets(this.#session);
+      const bucketOptions = buckets.map((b) => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
+      const body = `
+        <h2>Train a message</h2>
+        <p>Teach the classifier the correct bucket for a message file.</p>
+        <div class="error">Error: ${esc(String(e))}</div>
+        <form method="POST" action="/train">
+          <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
+            <label>Path to .eml file on server:
+              <input type="text" name="file" value="${esc(file)}" required style="width:100%">
+            </label>
+            <label>Bucket:
+              <select name="bucket" style="width:100%">${bucketOptions}</select>
+            </label>
+            <button class="btn-primary" style="align-self:flex-start">Train</button>
+          </div>
+        </form>`;
+      return this.#htmlPage("Train", body);
+    }
+  }
+
   #html404(): Response {
     return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
@@ -282,6 +367,7 @@ export class UIServer extends Module {
       ["Buckets", "/buckets"],
       ["Magnets", "/magnets"],
       ["Classify", "/classify"],
+      ["Train", "/train"],
     ].map(([label, href]) => `<a href="${href}">${label}</a>`).join(" | ");
 
     const html = `<!DOCTYPE html>
@@ -313,6 +399,8 @@ export class UIServer extends Module {
     .result{background:#fff;border-radius:8px;padding:16px;margin-top:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
     .badge{background:#2980b9;color:#fff;font-size:.75rem;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle}
     .error{background:#fdf0ef;border-left:3px solid #c0392b;padding:12px 16px;border-radius:4px;margin-top:12px;color:#c0392b}
+    .success{background:#edfaf1;border-left:3px solid #27ae60;padding:12px 16px;border-radius:4px;margin-bottom:16px;color:#1e8449}
+    .train-correction{margin-top:16px;padding-top:12px;border-top:1px solid #eee}
     p{margin-bottom:12px;color:#555;font-size:.9rem}
     code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:.85rem}
     label{display:flex;flex-direction:column;gap:4px;font-size:.9rem;color:#444}
