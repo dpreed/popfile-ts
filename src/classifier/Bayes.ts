@@ -387,6 +387,35 @@ export class Bayes extends Module {
     this.#updateConstants(userId);
   }
 
+  getBucketColors(sessionKey: string): Map<string, string> {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    const db = this.db_();
+    const rows = db.prepare(`
+      SELECT b.name, COALESCE(bp.val, bt.def)
+      FROM buckets b
+      JOIN bucket_template bt ON bt.name='color'
+      LEFT JOIN bucket_params bp ON bp.bucketid=b.id AND bp.btid=bt.id
+      WHERE b.userid=?
+    `).values<[string, string]>(userId);
+    return new Map(rows);
+  }
+
+  setBucketColor(sessionKey: string, bucketName: string, color: string): void {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    const bucket = this.#getBucketByName(userId, bucketName);
+    if (!bucket) throw new Error(`Unknown bucket: ${bucketName}`);
+    const db = this.db_();
+    const btRow = db.prepare("SELECT id FROM bucket_template WHERE name='color'").value<[number]>();
+    if (!btRow) return;
+    db.exec(
+      `INSERT INTO bucket_params (bucketid, btid, val) VALUES (?,?,?)
+       ON CONFLICT(bucketid, btid) DO UPDATE SET val=excluded.val`,
+      bucket.id, btRow[0], color
+    );
+  }
+
   getBucketWordCount(sessionKey: string, bucketName: string): number {
     const userId = this.#validSession(sessionKey);
     if (userId === null) throw new Error("Invalid session key");

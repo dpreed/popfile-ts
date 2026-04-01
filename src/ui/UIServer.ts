@@ -9,6 +9,7 @@
  *   GET  /buckets              → list buckets + word counts
  *   POST /buckets/create       → create a bucket
  *   POST /buckets/delete       → delete a bucket
+ *   POST /buckets/color        → set a bucket's colour
  *   GET  /magnets              → list magnets
  *   POST /magnets/add          → add a magnet
  *   POST /magnets/delete       → delete a magnet
@@ -83,6 +84,7 @@ export class UIServer extends Module {
       if (path === "/buckets" && req.method === "GET") return this.#pageBuckets(bayes);
       if (path === "/buckets/create" && req.method === "POST") return await this.#createBucket(req, bayes);
       if (path === "/buckets/delete" && req.method === "POST") return await this.#deleteBucket(req, bayes);
+      if (path === "/buckets/color" && req.method === "POST") return await this.#setBucketColor(req, bayes);
       if (path === "/magnets" && req.method === "GET") return this.#pageMagnets(bayes);
       if (path === "/magnets/add" && req.method === "POST") return await this.#addMagnet(req, bayes);
       if (path === "/magnets/delete" && req.method === "POST") return await this.#deleteMagnet(req, bayes);
@@ -147,10 +149,20 @@ export class UIServer extends Module {
 
   #pageBuckets(bayes: Bayes): Response {
     const buckets = bayes.getBuckets(this.#session);
+    const colors = bayes.getBucketColors(this.#session);
     const rows = buckets.map((name) => {
       const wc = bayes.getBucketWordCount(this.#session, name);
+      const color = colors.get(name) ?? "black";
       return `<tr>
-        <td>${esc(name)}</td>
+        <td>
+          ${dot(color)}${esc(name)}
+          <form method="POST" action="/buckets/color" style="display:inline;margin-left:8px">
+            <input type="hidden" name="name" value="${esc(name)}">
+            <input type="color" name="color" value="${colorToHex(color)}"
+              title="Pick colour" style="width:28px;height:22px;padding:1px;border:1px solid #ccc;border-radius:4px;cursor:pointer;vertical-align:middle"
+              onchange="this.form.submit()">
+          </form>
+        </td>
         <td>${wc.toLocaleString()}</td>
         <td>
           <form method="POST" action="/buckets/delete" style="display:inline">
@@ -185,6 +197,14 @@ export class UIServer extends Module {
     const form = await req.formData();
     const name = form.get("name") as string | null;
     if (name) bayes.deleteBucket(this.#session, name);
+    return Response.redirect(new URL("/buckets", req.url), 303);
+  }
+
+  async #setBucketColor(req: Request, bayes: Bayes): Promise<Response> {
+    const form = await req.formData();
+    const name = (form.get("name") as string | null)?.trim();
+    const color = (form.get("color") as string | null)?.trim();
+    if (name && color) bayes.setBucketColor(this.#session, name, color);
     return Response.redirect(new URL("/buckets", req.url), 303);
   }
 
@@ -262,16 +282,18 @@ export class UIServer extends Module {
     if (file) {
       try {
         const result = bayes.classify(this.#session, file);
+        const colors = bayes.getBucketColors(this.#session);
         const scoreRows = [...result.scores.entries()]
           .sort((a, b) => b[1] - a[1])
-          .map(([b, s]) => `<tr><td>${esc(b)}</td><td>${(s * 100).toFixed(4)}%</td></tr>`)
+          .map(([b, s]) => `<tr><td>${dot(colors.get(b) ?? "black")}${esc(b)}</td><td>${(s * 100).toFixed(4)}%</td></tr>`)
           .join("");
         const bucketOptions = buckets
           .map((b) => `<option value="${esc(b)}"${b === result.bucket ? " selected" : ""}>${esc(b)}</option>`)
           .join("");
+        const resultColor = colors.get(result.bucket) ?? "black";
         resultHtml = `
           <div class="result">
-            <h3>Result: <strong>${esc(result.bucket)}</strong>
+            <h3>Result: ${dot(resultColor)}<strong>${esc(result.bucket)}</strong>
               ${result.magnetUsed ? '<span class="badge">magnet</span>' : ""}
             </h3>
             <table>
@@ -360,20 +382,22 @@ export class UIServer extends Module {
   #pageHistory(bayes: Bayes): Response {
     const history = bayes.getHistory(this.#session, 100);
     const buckets = bayes.getBuckets(this.#session);
+    const colors = bayes.getBucketColors(this.#session);
     const bucketOptions = (selected: string) => buckets
       .map((b) => `<option value="${esc(b)}"${b === selected ? " selected" : ""}>${esc(b)}</option>`)
       .join("");
 
     const rows = history.map((h) => {
       const date = new Date(h.date * 1000).toLocaleString();
+      const color = colors.get(h.bucket) ?? "black";
       const corrected = h.usedtobe
-        ? `<span title="Corrected from ${esc(h.usedtobe)}" style="color:#888;font-size:.8rem"> (was ${esc(h.usedtobe)})</span>`
+        ? `<span title="Corrected from ${esc(h.usedtobe)}" style="color:#888;font-size:.8rem"> (was ${dot(colors.get(h.usedtobe) ?? "black")}${esc(h.usedtobe)})</span>`
         : "";
       return `<tr>
         <td style="white-space:nowrap;font-size:.85rem">${date}</td>
         <td>${esc(h.subject || "(no subject)")}</td>
         <td style="font-size:.85rem">${esc(h.fromAddress)}</td>
-        <td>${esc(h.bucket)}${h.magnetUsed ? ' <span class="badge">magnet</span>' : ""}${corrected}</td>
+        <td>${dot(color)}${esc(h.bucket)}${h.magnetUsed ? ' <span class="badge">magnet</span>' : ""}${corrected}</td>
         <td>
           <form method="POST" action="/history/retrain" class="inline-form" style="margin:0">
             <input type="hidden" name="id" value="${h.id}">
@@ -478,4 +502,21 @@ export class UIServer extends Module {
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function dot(color: string): string {
+  return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${esc(color)};margin-right:5px;vertical-align:middle"></span>`;
+}
+
+/** Convert a CSS colour name or hex value to a 6-digit hex string for <input type=color>. */
+function colorToHex(color: string): string {
+  if (/^#[0-9a-fA-F]{6}$/.test(color)) return color;
+  // Map common CSS colour names to hex
+  const names: Record<string, string> = {
+    black: "#000000", white: "#ffffff", red: "#ff0000", green: "#008000",
+    blue: "#0000ff", yellow: "#ffff00", orange: "#ffa500", purple: "#800080",
+    pink: "#ffc0cb", cyan: "#00ffff", magenta: "#ff00ff", grey: "#808080",
+    gray: "#808080", brown: "#a52a2a", navy: "#000080", teal: "#008080",
+  };
+  return names[color.toLowerCase()] ?? "#000000";
 }
