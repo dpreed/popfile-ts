@@ -11,6 +11,9 @@ deno task start
 # Classify a single .eml file from the CLI
 deno task classify /path/to/message.eml
 
+# Bulk-train .eml files into a bucket (files or directories, recursive)
+deno task train <bucket> <file-or-dir> [file-or-dir ...]
+
 # Run all tests
 deno task test
 

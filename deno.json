@@ -4,11 +4,13 @@
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi src/main.ts",
     "classify": "deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi src/classify.ts",
+    "train": "deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi src/train.ts",
     "test": "deno test --allow-net --allow-read --allow-write --allow-env --allow-ffi"
   },
   "imports": {
     "@db/sqlite": "jsr:@db/sqlite@^0.12",
     "@std/path": "jsr:@std/path@^1",
+    "@std/fs": "jsr:@std/fs@^1",
     "@std/log": "jsr:@std/log@^0.224",
     "@std/crypto": "jsr:@std/crypto@^1",
     "@std/encoding": "jsr:@std/encoding@^1",
