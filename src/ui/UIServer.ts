@@ -16,7 +16,8 @@
  *   POST /classify             → classify a message file
  *   GET  /train                → train form
  *   POST /train                → train a message file into a bucket
- *   GET  /history              → recent classification history
+ *   GET  /history              → recent 100 classifications
+ *   POST /history/retrain     → correct a history entry's bucket
  *   GET  /api/buckets          → JSON bucket list
  *   GET  /api/classify?file=   → JSON classify result
  *   POST /api/train            → JSON train endpoint
@@ -89,6 +90,8 @@ export class UIServer extends Module {
       if (path === "/classify" && req.method === "POST") return await this.#doClassify(req, bayes);
       if (path === "/train" && req.method === "GET") return this.#pageTrain(bayes);
       if (path === "/train" && req.method === "POST") return await this.#doTrain(req, bayes);
+      if (path === "/history" && req.method === "GET") return this.#pageHistory(bayes);
+      if (path === "/history/retrain" && req.method === "POST") return await this.#doHistoryRetrain(req, bayes);
 
       return this.#html404();
     } catch (e) {
@@ -354,6 +357,60 @@ export class UIServer extends Module {
     }
   }
 
+  #pageHistory(bayes: Bayes): Response {
+    const history = bayes.getHistory(this.#session, 100);
+    const buckets = bayes.getBuckets(this.#session);
+    const bucketOptions = (selected: string) => buckets
+      .map((b) => `<option value="${esc(b)}"${b === selected ? " selected" : ""}>${esc(b)}</option>`)
+      .join("");
+
+    const rows = history.map((h) => {
+      const date = new Date(h.date * 1000).toLocaleString();
+      const corrected = h.usedtobe
+        ? `<span title="Corrected from ${esc(h.usedtobe)}" style="color:#888;font-size:.8rem"> (was ${esc(h.usedtobe)})</span>`
+        : "";
+      return `<tr>
+        <td style="white-space:nowrap;font-size:.85rem">${date}</td>
+        <td>${esc(h.subject || "(no subject)")}</td>
+        <td style="font-size:.85rem">${esc(h.fromAddress)}</td>
+        <td>${esc(h.bucket)}${h.magnetUsed ? ' <span class="badge">magnet</span>' : ""}${corrected}</td>
+        <td>
+          <form method="POST" action="/history/retrain" class="inline-form" style="margin:0">
+            <input type="hidden" name="id" value="${h.id}">
+            <select name="bucket" style="font-size:.8rem;padding:4px 6px">${bucketOptions(h.bucket)}</select>
+            <button class="btn-primary" style="padding:4px 10px;font-size:.8rem">Retrain</button>
+          </form>
+        </td>
+      </tr>`;
+    }).join("");
+
+    const body = `
+      <h2>History <span style="font-weight:400;font-size:.9rem;color:#666">(last ${history.length})</span></h2>
+      ${history.length === 0
+        ? '<p>No classifications yet. Use <a href="/classify">Classify</a> to classify a message.</p>'
+        : `<table>
+            <thead><tr>
+              <th>Date</th><th>Subject</th><th>From</th><th>Classification</th><th>Correct to</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`}`;
+    return this.#htmlPage("History", body);
+  }
+
+  async #doHistoryRetrain(req: Request, bayes: Bayes): Promise<Response> {
+    const form = await req.formData();
+    const id = parseInt(form.get("id") as string, 10);
+    const bucket = (form.get("bucket") as string)?.trim();
+    if (!isNaN(id) && bucket) {
+      try {
+        bayes.retrainHistory(this.#session, id, bucket);
+      } catch (e) {
+        this.log_(0, `Retrain error: ${e}`);
+      }
+    }
+    return Response.redirect(new URL("/history", req.url), 303);
+  }
+
   #html404(): Response {
     return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
@@ -368,6 +425,7 @@ export class UIServer extends Module {
       ["Magnets", "/magnets"],
       ["Classify", "/classify"],
       ["Train", "/train"],
+      ["History", "/history"],
     ].map(([label, href]) => `<a href="${href}">${label}</a>`).join(" | ");
 
     const html = `<!DOCTYPE html>

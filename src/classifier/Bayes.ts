@@ -28,6 +28,17 @@ export interface ClassifyResult {
   magnetUsed: boolean;
 }
 
+export interface HistoryRow {
+  id: number;
+  filename: string;
+  date: number;
+  fromAddress: string;
+  subject: string;
+  bucket: string;
+  usedtobe: string | null;
+  magnetUsed: boolean;
+}
+
 interface Bucket {
   id: number;
   name: string;
@@ -142,7 +153,65 @@ export class Bayes extends Module {
     if (userId === null) throw new Error("Invalid session key");
 
     const parsed = this.#parser.parseFile(filePath);
-    return this.classifyParsed(userId, parsed);
+    const result = this.classifyParsed(userId, parsed);
+    this.#writeHistory(userId, filePath, parsed, result);
+    return result;
+  }
+
+  getHistory(sessionKey: string, limit = 100): HistoryRow[] {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    const db = this.db_();
+    const rows = db.prepare(`
+      SELECT h.id, h.filename, h.date, h.from_address, h.subject,
+             COALESCE(b.name, 'unclassified') AS bucket,
+             ub.name AS usedtobe,
+             CASE WHEN h.magnetid IS NOT NULL THEN 1 ELSE 0 END AS magnet_used
+      FROM history h
+      LEFT JOIN buckets b  ON h.bucketid = b.id
+      LEFT JOIN buckets ub ON h.usedtobe = ub.id
+      WHERE h.userid = ?
+      ORDER BY h.date DESC
+      LIMIT ?
+    `).values<[number, string, number, string, string, string, string | null, number]>(userId, limit);
+    return rows.map(([id, filename, date, fromAddress, subject, bucket, usedtobe, magnetUsed]) => ({
+      id, filename, date, fromAddress, subject, bucket,
+      usedtobe: usedtobe ?? null,
+      magnetUsed: magnetUsed === 1,
+    }));
+  }
+
+  retrainHistory(sessionKey: string, historyId: number, newBucket: string): void {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    const db = this.db_();
+
+    const row = db.prepare(
+      "SELECT filename, bucketid FROM history WHERE id=? AND userid=?"
+    ).value<[string, number | null]>(historyId, userId);
+    if (!row) throw new Error("History entry not found");
+
+    const [filename, oldBucketId] = row;
+    const newBucketRow = this.#getBucketByName(userId, newBucket);
+    if (!newBucketRow) throw new Error(`Unknown bucket: ${newBucket}`);
+
+    // Record the correction
+    db.exec(
+      "UPDATE history SET usedtobe=bucketid, bucketid=? WHERE id=?",
+      newBucketRow.id, historyId
+    );
+
+    // Train the message into the new bucket
+    const parsed = this.#parser.parseFile(filename);
+    this.trainMessage(sessionKey, newBucket, parsed);
+
+    // If it had a previous bucket, untrain from it
+    if (oldBucketId !== null) {
+      const oldBucket = db.prepare("SELECT name FROM buckets WHERE id=?").value<[string]>(oldBucketId);
+      if (oldBucket) {
+        this.#untrainMessage(userId, oldBucket[0], parsed);
+      }
+    }
   }
 
   /** Classify an already-parsed message (used internally). */
@@ -424,6 +493,39 @@ export class Bayes extends Module {
       }
       this.#bucketStart.set(uid, startMap);
     }
+  }
+
+  #writeHistory(userId: number, filePath: string, parsed: ParseResult, result: ClassifyResult): void {
+    const db = this.db_();
+    const bucket = result.bucket !== "unclassified"
+      ? this.#getBucketByName(userId, result.bucket)
+      : null;
+    db.exec(
+      `INSERT INTO history (userid, filename, bucketid, date, from_address, to_address, subject, inserted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+      userId,
+      filePath,
+      bucket?.id ?? null,
+      Math.floor(Date.now() / 1000),
+      parsed.headers.get("from") ?? "",
+      parsed.headers.get("to") ?? "",
+      parsed.headers.get("subject") ?? "",
+    );
+  }
+
+  #untrainMessage(userId: number, bucketName: string, parsed: ParseResult): void {
+    const bucket = this.#getBucketByName(userId, bucketName);
+    if (!bucket) return;
+    const db = this.db_();
+    for (const [word, count] of parsed.words) {
+      const wordRow = db.prepare("SELECT id FROM words WHERE word=?").value<[number]>(word);
+      if (!wordRow) continue;
+      db.exec(
+        `UPDATE matrix SET times=MAX(0, times-?) WHERE wordid=? AND bucketid=?`,
+        count, wordRow[0], bucket.id
+      );
+    }
+    this.#updateConstants(userId);
   }
 
   #checkMagnets(userId: number, parsed: ParseResult): string | null {
