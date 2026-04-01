@@ -62,6 +62,24 @@ Modules access siblings through typed protected methods: `mq_()`, `configuration
 | `POPFILE_POP3_PORT` | `1110` | POP3 proxy listen port |
 | `POPFILE_UI_PORT` | `8080` | Web UI listen port |
 
+### IMAP service
+
+Set these environment variables (or config keys) to enable:
+
+| Variable | Config key | Description |
+|----------|-----------|-------------|
+| `POPFILE_IMAP_SERVER` | `imap_server` | IMAP hostname (required to enable) |
+| `POPFILE_IMAP_PORT` | `imap_port` | Port (default 143; 993 for TLS) |
+| `POPFILE_IMAP_TLS` | `imap_tls` | Use TLS: 0 or 1 (default 0) |
+| `POPFILE_IMAP_USERNAME` | `imap_username` | Login username |
+| `POPFILE_IMAP_PASSWORD` | `imap_password` | Login password |
+| `POPFILE_IMAP_WATCH_FOLDER` | `imap_watch_folder` | Folder to monitor (default INBOX) |
+| `POPFILE_IMAP_MOVE` | `imap_move` | Move to bucket folders: 0 or 1 (default 1) |
+| `POPFILE_IMAP_FOLDER_PREFIX` | `imap_folder_prefix` | Prefix for bucket folder names |
+| `POPFILE_IMAP_INTERVAL` | `imap_interval` | Seconds between checks (default 60) |
+
+When `imap_move=1`, each classified message is copied to a folder named after its bucket (e.g. `spam`, `inbox`), then deleted from the watch folder. Folders are created automatically.
+
 ### Not yet ported
 
 `Proxy::NNTP`, `Proxy::SMTP`, `Proxy::POP3S`, `Services::IMAP`, `UI::XMLRPC`, multi-user UI, history page, bucket colours, CJK tokenisation. Each maps 1:1 to a Perl module and can be added without touching core infrastructure.

@@ -20,6 +20,7 @@ import { Logger } from "./core/Logger.ts";
 import { Database } from "./core/Database.ts";
 import { Bayes } from "./classifier/Bayes.ts";
 import { POP3Proxy } from "./proxy/POP3Proxy.ts";
+import { IMAPService } from "./services/IMAPService.ts";
 import { UIServer } from "./ui/UIServer.ts";
 
 const loader = new Loader();
@@ -60,9 +61,10 @@ loader.register("database", new Database(), 2);
 loader.register("classifier", new Bayes(), 3);
 
 // ---------------------------------------------------------------------------
-// Level 4 — Proxies (depend on classifier)
+// Level 4 — Proxies and services (depend on classifier)
 // ---------------------------------------------------------------------------
 loader.register("pop3", new POP3Proxy(), 4);
+loader.register("imap", new IMAPService(), 4);
 
 // ---------------------------------------------------------------------------
 // Level 5 — UI (depends on classifier)

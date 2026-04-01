@@ -214,6 +214,13 @@ export class Bayes extends Module {
     }
   }
 
+  /** Classify an already-parsed message via session key (no file path required). */
+  classifyMessage(sessionKey: string, parsed: ParseResult): ClassifyResult {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    return this.classifyParsed(userId, parsed);
+  }
+
   /** Classify an already-parsed message (used internally). */
   classifyParsed(userId: number, parsed: ParseResult): ClassifyResult {
     const buckets = this.#getBuckets(userId);
