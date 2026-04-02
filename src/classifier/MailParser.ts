@@ -23,6 +23,10 @@ const WORD_BOUNDARY = /[^a-z0-9\u00C0-\u024F\u0400-\u04FF]+/gi;
 const MIN_WORD_LEN = 3;
 const MAX_WORD_LEN = 40;
 
+// CJK scripts don't use spaces between words; extract overlapping bigrams instead.
+// Covers CJK unified ideographs, hiragana, katakana, compatibility ideographs, hangul.
+const CJK_RUN = /[\u3000-\u9FFF\uF900-\uFAFF\uAC00-\uD7AF]+/g;
+
 // Tags whose content should be completely discarded
 const SKIP_TAGS = new Set(["script", "style", "head", "meta", "link"]);
 
@@ -203,6 +207,17 @@ export class MailParser {
   // -------------------------------------------------------------------------
 
   #addWords(map: Map<string, number>, text: string): void {
+    // CJK bigrams — extract before the Latin split (which discards CJK chars).
+    // Use spread to correctly iterate Unicode code points (handles surrogates).
+    for (const run of text.matchAll(CJK_RUN)) {
+      const chars = [...run[0]];
+      for (let i = 0; i + 1 < chars.length; i++) {
+        const bigram = chars[i] + chars[i + 1];
+        map.set(bigram, (map.get(bigram) ?? 0) + 1);
+      }
+    }
+
+    // Latin / Cyrillic / extended-Latin word extraction
     const tokens = text
       .toLowerCase()
       .split(WORD_BOUNDARY)

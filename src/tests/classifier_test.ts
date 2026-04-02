@@ -142,6 +142,75 @@ Deno.test("MailParser: word frequency counting", () => {
 });
 
 // ---------------------------------------------------------------------------
+// CJK bigram tokenisation
+// ---------------------------------------------------------------------------
+
+Deno.test("MailParser: extracts CJK bigrams from Japanese text", () => {
+  // "日本語のメール" = "Japanese language email"
+  const raw = "Subject: テスト\r\n\r\n日本語のメール";
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+
+  // Expect bigrams from each CJK run (hiragana "の" bridges two runs)
+  assert(words.has("日本"), "should have bigram 日本");
+  assert(words.has("本語"), "should have bigram 本語");
+  assert(words.has("メー"), "should have bigram from katakana run");
+  assert(words.has("ール"), "should have bigram from katakana run");
+});
+
+Deno.test("MailParser: CJK bigram frequency counted correctly", () => {
+  // Repeat the same two-character word three times
+  const raw = "Subject: test\r\n\r\n中文 中文 中文";
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+
+  // "中文" appears 3 times — each occurrence is its own two-char run → 1 bigram per run
+  assertEquals(words.get("中文"), 3);
+});
+
+Deno.test("MailParser: CJK bigrams from Chinese sentence", () => {
+  // "这是一封垃圾邮件" = "This is a spam email"
+  const raw = "Subject: test\r\n\r\n这是一封垃圾邮件";
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+
+  assert(words.has("这是"), "should have bigram 这是");
+  assert(words.has("是一"), "should have bigram 是一");
+  assert(words.has("垃圾"), "should have bigram 垃圾");
+  assert(words.has("邮件"), "should have bigram 邮件");
+});
+
+Deno.test("MailParser: CJK bigrams from Hangul (Korean)", () => {
+  // "안녕하세요" = "Hello"
+  const raw = "Subject: test\r\n\r\n안녕하세요";
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+
+  assert(words.has("안녕"), "should have bigram 안녕");
+  assert(words.has("녕하"), "should have bigram 녕하");
+});
+
+Deno.test("MailParser: mixed CJK and Latin text both tokenised", () => {
+  const raw = "Subject: test\r\n\r\nHello 日本語 world";
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+
+  assert(words.has("hello"), "should have Latin word 'hello'");
+  assert(words.has("world"), "should have Latin word 'world'");
+  assert(words.has("日本"), "should have CJK bigram");
+  assert(words.has("本語"), "should have CJK bigram");
+});
+
+Deno.test("MailParser: single CJK character produces no bigrams", () => {
+  const raw = "Subject: test\r\n\r\n中";
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+
+  // A single CJK char has no bigram partner — nothing should be emitted from it
+  assertEquals([...words.keys()].filter((k) => /[\u3000-\u9FFF]/.test(k)).length, 0);
+});
+
+// ---------------------------------------------------------------------------
 // Integration test: classify a real .eml file written to disk
 // ---------------------------------------------------------------------------
 
