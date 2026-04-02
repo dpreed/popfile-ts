@@ -215,11 +215,16 @@ class IMAPClient {
 // Module
 // ---------------------------------------------------------------------------
 
+const BACKOFF_INITIAL = 30_000;   // 30 s
+const BACKOFF_MAX     = 1_800_000; // 30 min
+
 export class IMAPService extends Module {
   #client: IMAPClient | null = null;
   #lastCheck = 0;
   #running = false;
   #session = "";
+  #failureDelay = 0;   // current back-off step (ms); 0 = no active back-off
+  #nextRetry = 0;      // absolute timestamp before which we must not retry
 
   constructor() {
     super();
@@ -257,16 +262,26 @@ export class IMAPService extends Module {
 
   override service(): boolean {
     if (!this.config_("server") || this.#running) return true;
+    const now = Date.now();
+    if (now < this.#nextRetry) return true;
     const interval = parseInt(this.config_("interval")) * 1000;
-    if (Date.now() - this.#lastCheck < interval) return true;
-    this.#lastCheck = Date.now();
+    if (now - this.#lastCheck < interval) return true;
+    this.#lastCheck = now;
     this.#running = true;
     this.#checkAndClassify()
+      .then(() => {
+        this.#failureDelay = 0;
+        this.#nextRetry = 0;
+      })
       .catch((e) => {
         this.log_(0, `IMAP error: ${e}`);
-        // Force reconnect on next tick
         this.#client?.close();
         this.#client = null;
+        this.#failureDelay = this.#failureDelay === 0
+          ? BACKOFF_INITIAL
+          : Math.min(this.#failureDelay * 2, BACKOFF_MAX);
+        this.#nextRetry = Date.now() + this.#failureDelay;
+        this.log_(0, `IMAP: next retry in ${this.#failureDelay / 1000}s`);
       })
       .finally(() => { this.#running = false; });
     return true;

@@ -25,7 +25,7 @@
  */
 
 import { Module, LifecycleResult } from "../core/Module.ts";
-import { Bayes, type Stats } from "../classifier/Bayes.ts";
+import { Bayes, type Stats, type WordScore } from "../classifier/Bayes.ts";
 
 export class UIServer extends Module {
   #server: Deno.HttpServer | null = null;
@@ -97,6 +97,7 @@ export class UIServer extends Module {
       if (path === "/history" && req.method === "GET") return this.#pageHistory(bayes);
       if (path === "/history/retrain" && req.method === "POST") return await this.#doHistoryRetrain(req, bayes);
       if (path === "/stats" && req.method === "GET") return this.#pageStats(bayes);
+      if (path === "/wordscores" && req.method === "GET") return this.#pageWordScores(bayes, url);
 
       return this.#html404();
     } catch (e) {
@@ -303,6 +304,11 @@ export class UIServer extends Module {
               <thead><tr><th>Bucket</th><th>Score</th></tr></thead>
               <tbody>${scoreRows}</tbody>
             </table>
+            <p style="margin-top:10px">
+              <a href="/wordscores?file=${encodeURIComponent(file)}" style="font-size:.85rem">
+                Show word scores →
+              </a>
+            </p>
             ${buckets.length > 0 ? `
             <div class="train-correction">
               <p>Was this wrong? Train as:</p>
@@ -509,6 +515,102 @@ export class UIServer extends Module {
     return this.#htmlPage("Stats", body);
   }
 
+  // -------------------------------------------------------------------------
+  // Word scores page
+  // -------------------------------------------------------------------------
+
+  #pageWordScores(bayes: Bayes, url: URL): Response {
+    const file = url.searchParams.get("file")?.trim() ?? "";
+    const buckets = bayes.getBuckets(this.#session);
+    const colors  = bayes.getBucketColors(this.#session);
+
+    let resultHtml = "";
+    if (file) {
+      try {
+        const result = bayes.classifyWithWordScores(this.#session, file);
+        const resultColor = colors.get(result.bucket) ?? "black";
+
+        const scoreRows = [...result.scores.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([b, s]) => `<tr><td>${dot(colors.get(b) ?? "black")}${esc(b)}</td><td>${(s * 100).toFixed(2)}%</td></tr>`)
+          .join("");
+
+        const wordRows = this.#renderWordRows(result.wordScores, buckets, colors);
+
+        resultHtml = `
+          <div class="result" style="margin-bottom:24px">
+            <h3>Classification: ${dot(resultColor)}<strong>${esc(result.bucket)}</strong>
+              ${result.magnetUsed ? '<span class="badge">magnet</span>' : ""}
+            </h3>
+            <table style="max-width:360px;margin-bottom:0">
+              <thead><tr><th>Bucket</th><th>Score</th></tr></thead>
+              <tbody>${scoreRows}</tbody>
+            </table>
+          </div>
+          ${result.wordScores.length === 0
+            ? '<p>No trained words found in this message.</p>'
+            : `<h3 style="margin-bottom:12px">Top discriminating words</h3>
+               <table>
+                 <thead><tr>
+                   <th>Word</th><th>Count</th>
+                   ${buckets.map((b) => `<th>${dot(colors.get(b) ?? "black")}${esc(b)}</th>`).join("")}
+                   <th>Pushes toward</th>
+                 </tr></thead>
+                 <tbody>${wordRows}</tbody>
+               </table>`}`;
+      } catch (e) {
+        resultHtml = `<div class="error">Error: ${esc(String(e))}</div>`;
+      }
+    }
+
+    const body = `
+      <h2>Word scores</h2>
+      <p>Shows which words most influenced the classification of a message.</p>
+      <form method="GET" action="/wordscores" class="inline-form">
+        <input type="text" name="file" value="${esc(file)}" placeholder="/path/to/message.eml" style="width:400px" required>
+        <button class="btn-primary">Analyse</button>
+      </form>
+      ${resultHtml}`;
+    return this.#htmlPage("Word scores", body);
+  }
+
+  #renderWordRows(
+    wordScores: WordScore[],
+    buckets: string[],
+    colors: Map<string, string>,
+  ): string {
+    // Find the max probability across all words/buckets for bar scaling
+    let maxProb = 0;
+    for (const ws of wordScores) {
+      for (const p of ws.bucketProbs.values()) if (p > maxProb) maxProb = p;
+    }
+    if (maxProb === 0) maxProb = 1;
+
+    return wordScores.map((ws) => {
+      const probCells = buckets.map((b) => {
+        const p = ws.bucketProbs.get(b) ?? 0;
+        const pct = (p / maxProb * 100).toFixed(1);
+        const color = colors.get(b) ?? "#888";
+        return `<td>
+          <div style="display:flex;align-items:center;gap:6px">
+            <div style="width:64px;background:#eee;border-radius:3px;height:8px">
+              <div style="width:${pct}%;background:${esc(color)};height:8px;border-radius:3px"></div>
+            </div>
+            <span style="font-size:.8rem;min-width:40px">${(p * 100).toFixed(3)}%</span>
+          </div>
+        </td>`;
+      }).join("");
+
+      const topColor = colors.get(ws.topBucket) ?? "black";
+      return `<tr>
+        <td><code>${esc(ws.word)}</code></td>
+        <td style="text-align:center">${ws.freq}</td>
+        ${probCells}
+        <td>${dot(topColor)}${esc(ws.topBucket)}</td>
+      </tr>`;
+    }).join("");
+  }
+
   #html404(): Response {
     return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
@@ -523,6 +625,7 @@ export class UIServer extends Module {
       ["Buckets", "/buckets"],
       ["Magnets", "/magnets"],
       ["Classify", "/classify"],
+      ["Word scores", "/wordscores"],
       ["Train", "/train"],
       ["History", "/history"],
     ].map(([label, href]) => `<a href="${href}">${label}</a>`).join(" | ");

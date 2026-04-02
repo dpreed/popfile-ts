@@ -54,6 +54,19 @@ export interface Stats {
   buckets: BucketStat[];
 }
 
+export interface WordScore {
+  word: string;
+  freq: number;
+  /** P(word | bucket) for each bucket */
+  bucketProbs: Map<string, number>;
+  /** Bucket with the highest probability for this word */
+  topBucket: string;
+}
+
+export interface ClassifyWithWordScoresResult extends ClassifyResult {
+  wordScores: WordScore[];
+}
+
 interface Bucket {
   id: number;
   name: string;
@@ -234,6 +247,85 @@ export class Bayes extends Module {
     const userId = this.#validSession(sessionKey);
     if (userId === null) throw new Error("Invalid session key");
     return this.classifyParsed(userId, parsed);
+  }
+
+  /**
+   * Classify a file and return per-word probability scores alongside the
+   * normal result. Words are sorted by discriminativeness (max−min
+   * probability across buckets, weighted by frequency) and the top `topN`
+   * are returned.  History is written exactly as with classify().
+   */
+  classifyWithWordScores(
+    sessionKey: string,
+    filePath: string,
+    topN = 20,
+  ): ClassifyWithWordScoresResult {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+
+    const parsed = this.#parser.parseFile(filePath);
+    const result = this.classifyParsed(userId, parsed);
+    this.#writeHistory(userId, filePath, parsed, result);
+
+    const wordList = [...parsed.words.keys()];
+    if (wordList.length === 0) return { ...result, wordScores: [] };
+
+    const db = this.db_();
+    const buckets = this.#getBuckets(userId).filter((b) => !b.pseudo);
+    if (buckets.length < 2) return { ...result, wordScores: [] };
+
+    const bucketTotalWords = this.#getBucketWordCounts(userId);
+
+    // Resolve word→id for words we know about
+    const ph = wordList.map(() => "?").join(",");
+    const wordRows = db.prepare(
+      `SELECT id, word FROM words WHERE word IN (${ph})`
+    ).values<[number, string]>(...wordList);
+    const idWordMap = new Map<number, string>();
+    for (const [id, word] of wordRows) idWordMap.set(id, word);
+
+    const idList = [...idWordMap.keys()];
+    if (idList.length === 0) return { ...result, wordScores: [] };
+
+    const idPh = idList.map(() => "?").join(",");
+    const matrixRows = db.prepare(
+      `SELECT m.times, m.wordid, b.name
+       FROM matrix m JOIN buckets b ON m.bucketid = b.id
+       WHERE m.wordid IN (${idPh}) AND b.userid = ?`
+    ).values<[number, number, string]>(...idList, userId);
+
+    const matrix = new Map<number, Map<string, number>>();
+    for (const [times, wordid, bucketName] of matrixRows) {
+      if (!matrix.has(wordid)) matrix.set(wordid, new Map());
+      matrix.get(wordid)!.set(bucketName, times);
+    }
+
+    const wordScores: WordScore[] = [];
+    for (const id of idList) {
+      const word = idWordMap.get(id)!;
+      const freq = parsed.words.get(word) ?? 1;
+      const wordMatrix = matrix.get(id);
+      const bucketProbs = new Map<string, number>();
+      let topBucket = buckets[0].name;
+      let topProb = -1;
+      for (const b of buckets) {
+        const count = wordMatrix?.get(b.name) ?? 0;
+        const total = bucketTotalWords.get(b.name) ?? 1;
+        const prob = count > 0 ? count / total : 0;
+        bucketProbs.set(b.name, prob);
+        if (prob > topProb) { topProb = prob; topBucket = b.name; }
+      }
+      wordScores.push({ word, freq, bucketProbs, topBucket });
+    }
+
+    // Sort by discriminativeness = (max_prob − min_prob) × freq
+    wordScores.sort((a, b) => {
+      const disc = (ws: WordScore) =>
+        (Math.max(...ws.bucketProbs.values()) - Math.min(...ws.bucketProbs.values())) * ws.freq;
+      return disc(b) - disc(a);
+    });
+
+    return { ...result, wordScores: wordScores.slice(0, topN) };
   }
 
   /** Classify an already-parsed message (used internally). */
