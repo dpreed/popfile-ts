@@ -21,6 +21,7 @@ import { Database } from "./core/Database.ts";
 import { Bayes } from "./classifier/Bayes.ts";
 import { POP3Proxy } from "./proxy/POP3Proxy.ts";
 import { POP3SProxy } from "./proxy/POP3SProxy.ts";
+import { SMTPProxy } from "./proxy/SMTPProxy.ts";
 import { IMAPService } from "./services/IMAPService.ts";
 import { UIServer } from "./ui/UIServer.ts";
 
@@ -66,6 +67,7 @@ loader.register("classifier", new Bayes(), 3);
 // ---------------------------------------------------------------------------
 loader.register("pop3", new POP3Proxy(), 4);
 loader.register("pop3s", new POP3SProxy(), 4);
+loader.register("smtp", new SMTPProxy(), 4);
 loader.register("imap", new IMAPService(), 4);
 
 // ---------------------------------------------------------------------------

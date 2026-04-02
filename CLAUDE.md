@@ -88,6 +88,18 @@ Username format: `youruser:realserver.com` or `youruser:realserver.com:995`
 
 If no port is given, defaults to upstream port **995**. TLS is also auto-enabled when the upstream port is 995.
 
+### SMTP proxy
+
+Listens on port **1025** (or `smtp_port`). Relays all SMTP commands to a pre-configured upstream server, intercepting `DATA` to classify the message and inject `X-Text-Classification`.
+
+| Config key | Default | Description |
+|-----------|---------|-------------|
+| `smtp_server` | *(empty — disabled)* | Upstream SMTP hostname (required to enable) |
+| `smtp_server_port` | `25` | Upstream port |
+| `smtp_tls` | `0` | Use TLS for upstream connection |
+
+Configure your mail client to use `127.0.0.1:1025` as its outgoing SMTP server.
+
 ### Not yet ported
 
-`Proxy::NNTP`, `Proxy::SMTP`, `Proxy::POP3S`, `Services::IMAP`, `UI::XMLRPC`, multi-user UI, history page, bucket colours, CJK tokenisation. Each maps 1:1 to a Perl module and can be added without touching core infrastructure.
+`Proxy::NNTP`, `UI::XMLRPC`, multi-user UI, CJK tokenisation. Each maps 1:1 to a Perl module and can be added without touching core infrastructure.
