@@ -93,6 +93,8 @@ export class Bayes extends Module {
 
   // Session management
   #sessions: Map<string, { userId: number; expires: number }> = new Map();
+  #lastSweep = 0;
+
   constructor() {
     super();
     this.name_ = "classifier";
@@ -105,11 +107,23 @@ export class Bayes extends Module {
 
   override start(): LifecycleResult {
     this.#updateConstants();
+    this.mqRegister_("TICKD", this);
     return LifecycleResult.Ok;
   }
 
+  /** Sweep expired sessions on the hourly TICKD tick. */
+  override deliver(type: string): void {
+    if (type === "TICKD") this.#releaseExpiredSessions();
+  }
+
   override service(): boolean {
-    this.#releaseExpiredSessions();
+    // Sweep at most once per minute — lazy eviction in #validSession handles
+    // the common case; this prevents unbounded accumulation of stale keys.
+    const now = Date.now();
+    if (now - this.#lastSweep >= 60_000) {
+      this.#releaseExpiredSessions();
+      this.#lastSweep = now;
+    }
     return true;
   }
 
