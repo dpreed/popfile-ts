@@ -25,7 +25,7 @@
  */
 
 import { Module, LifecycleResult } from "../core/Module.ts";
-import { Bayes } from "../classifier/Bayes.ts";
+import { Bayes, type Stats } from "../classifier/Bayes.ts";
 
 export class UIServer extends Module {
   #server: Deno.HttpServer | null = null;
@@ -80,7 +80,9 @@ export class UIServer extends Module {
       if (path === "/api/train" && req.method === "POST") return await this.#apiTrain(req, bayes);
 
       // HTML routes
-      if (path === "/" || path === "") return Response.redirect(new URL("/buckets", req.url));
+      if (path === "/api/stats") return this.#apiStats(bayes);
+
+      if (path === "/" || path === "") return Response.redirect(new URL("/stats", req.url));
       if (path === "/buckets" && req.method === "GET") return this.#pageBuckets(bayes);
       if (path === "/buckets/create" && req.method === "POST") return await this.#createBucket(req, bayes);
       if (path === "/buckets/delete" && req.method === "POST") return await this.#deleteBucket(req, bayes);
@@ -94,6 +96,7 @@ export class UIServer extends Module {
       if (path === "/train" && req.method === "POST") return await this.#doTrain(req, bayes);
       if (path === "/history" && req.method === "GET") return this.#pageHistory(bayes);
       if (path === "/history/retrain" && req.method === "POST") return await this.#doHistoryRetrain(req, bayes);
+      if (path === "/stats" && req.method === "GET") return this.#pageStats(bayes);
 
       return this.#html404();
     } catch (e) {
@@ -435,6 +438,77 @@ export class UIServer extends Module {
     return Response.redirect(new URL("/history", req.url), 303);
   }
 
+  // -------------------------------------------------------------------------
+  // Stats page
+  // -------------------------------------------------------------------------
+
+  #apiStats(bayes: Bayes): Response {
+    return Response.json(bayes.getStats(this.#session));
+  }
+
+  #pageStats(bayes: Bayes): Response {
+    const s = bayes.getStats(this.#session);
+    const accuracy = s.totalClassified > 0
+      ? (((s.totalClassified - s.totalRetrained) / s.totalClassified) * 100).toFixed(1)
+      : null;
+
+    const cards = [
+      ["Classified", s.totalClassified.toLocaleString(), "#1a1a2e"],
+      ["Total words", s.totalWords.toLocaleString(), "#2c7a4b"],
+      ["Magnet hits", s.magnetHits.toLocaleString(), "#2980b9"],
+      ["Accuracy", accuracy !== null ? `${accuracy}%` : "—", "#7d3c98"],
+    ].map(([label, value, color]) => `
+      <div style="background:#fff;border-radius:8px;padding:20px 24px;box-shadow:0 1px 4px rgba(0,0,0,.08);min-width:140px;flex:1">
+        <div style="font-size:2rem;font-weight:600;color:${color}">${value}</div>
+        <div style="font-size:.85rem;color:#666;margin-top:4px">${label}</div>
+      </div>`).join("");
+
+    const maxWords = Math.max(1, ...s.buckets.map((b) => b.wordCount));
+    const maxClassified = Math.max(1, ...s.buckets.map((b) => b.classifiedCount));
+
+    const bucketRows = s.buckets.map((b) => {
+      const wordPct = (b.wordCount / maxWords * 100).toFixed(1);
+      const clsPct  = (b.classifiedCount / maxClassified * 100).toFixed(1);
+      return `<tr>
+        <td>${dot(b.color)}${esc(b.name)}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="flex:1;background:#eee;border-radius:3px;height:10px;min-width:80px">
+              <div style="width:${wordPct}%;background:#2c7a4b;height:10px;border-radius:3px"></div>
+            </div>
+            <span style="min-width:60px;text-align:right;font-size:.85rem">${b.wordCount.toLocaleString()}</span>
+          </div>
+        </td>
+        <td>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="flex:1;background:#eee;border-radius:3px;height:10px;min-width:80px">
+              <div style="width:${clsPct}%;background:#2980b9;height:10px;border-radius:3px"></div>
+            </div>
+            <span style="min-width:40px;text-align:right;font-size:.85rem">${b.classifiedCount.toLocaleString()}</span>
+          </div>
+        </td>
+      </tr>`;
+    }).join("");
+
+    const retrainNote = s.totalRetrained > 0
+      ? `<p style="margin-top:8px;font-size:.85rem;color:#888">${s.totalRetrained.toLocaleString()} message${s.totalRetrained === 1 ? "" : "s"} retrained after classification.</p>`
+      : "";
+
+    const body = `
+      <h2>Statistics</h2>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:28px">${cards}</div>
+      ${retrainNote}
+      ${s.buckets.length === 0
+        ? '<p>No buckets yet. <a href="/buckets">Create one</a> to get started.</p>'
+        : `<h3 style="margin-bottom:12px">Per-bucket breakdown</h3>
+           <table>
+             <thead><tr><th>Bucket</th><th>Words trained</th><th>Messages classified</th></tr></thead>
+             <tbody>${bucketRows}</tbody>
+           </table>`}`;
+
+    return this.#htmlPage("Stats", body);
+  }
+
   #html404(): Response {
     return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
@@ -445,6 +519,7 @@ export class UIServer extends Module {
 
   #htmlPage(title: string, content: string): Response {
     const navItems = [
+      ["Stats", "/stats"],
       ["Buckets", "/buckets"],
       ["Magnets", "/magnets"],
       ["Classify", "/classify"],

@@ -39,6 +39,21 @@ export interface HistoryRow {
   magnetUsed: boolean;
 }
 
+export interface BucketStat {
+  name: string;
+  color: string;
+  wordCount: number;
+  classifiedCount: number;
+}
+
+export interface Stats {
+  totalClassified: number;
+  totalRetrained: number;
+  magnetHits: number;
+  totalWords: number;
+  buckets: BucketStat[];
+}
+
 interface Bucket {
   id: number;
   name: string;
@@ -433,6 +448,48 @@ export class Bayes extends Module {
        WHERE b.userid=? AND b.name=?`
     ).value<[number]>(userId, bucketName);
     return row?.[0] ?? 0;
+  }
+
+  getStats(sessionKey: string): Stats {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    const db = this.db_();
+
+    const totalClassified = db.prepare(
+      "SELECT COUNT(*) FROM history WHERE userid=?"
+    ).value<[number]>(userId)?.[0] ?? 0;
+
+    const totalRetrained = db.prepare(
+      "SELECT COUNT(*) FROM history WHERE userid=? AND usedtobe IS NOT NULL"
+    ).value<[number]>(userId)?.[0] ?? 0;
+
+    const magnetHits = db.prepare(
+      "SELECT COUNT(*) FROM history WHERE userid=? AND magnetid IS NOT NULL"
+    ).value<[number]>(userId)?.[0] ?? 0;
+
+    // Per-bucket: word count, classification count, color
+    const rows = db.prepare(`
+      SELECT b.name,
+             COALESCE(SUM(m.times), 0)                       AS words,
+             COUNT(h.id)                                      AS classified,
+             COALESCE(bp.val, bt.def)                         AS color
+      FROM   buckets b
+      JOIN   bucket_template bt ON bt.name = 'color'
+      LEFT   JOIN matrix m      ON m.bucketid = b.id
+      LEFT   JOIN bucket_params bp ON bp.bucketid = b.id AND bp.btid = bt.id
+      LEFT   JOIN history h     ON h.bucketid = b.id AND h.userid = b.userid
+      WHERE  b.userid = ? AND b.pseudo = 0
+      GROUP  BY b.id
+      ORDER  BY b.name
+    `).values<[string, number, number, string]>(userId);
+
+    const buckets: BucketStat[] = rows.map(([name, wordCount, classifiedCount, color]) => ({
+      name, color, wordCount, classifiedCount,
+    }));
+
+    const totalWords = buckets.reduce((s, b) => s + b.wordCount, 0);
+
+    return { totalClassified, totalRetrained, magnetHits, totalWords, buckets };
   }
 
   // -------------------------------------------------------------------------
