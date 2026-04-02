@@ -98,6 +98,8 @@ export class UIServer extends Module {
       if (path === "/history/retrain" && req.method === "POST") return await this.#doHistoryRetrain(req, bayes);
       if (path === "/stats" && req.method === "GET") return this.#pageStats(bayes);
       if (path === "/wordscores" && req.method === "GET") return this.#pageWordScores(bayes, url);
+      if (path === "/settings" && req.method === "GET") return this.#pageSettings();
+      if (path === "/settings" && req.method === "POST") return await this.#doSettings(req);
 
       return this.#html404();
     } catch (e) {
@@ -611,6 +613,167 @@ export class UIServer extends Module {
     }).join("");
   }
 
+  // -------------------------------------------------------------------------
+  // Settings page
+  // -------------------------------------------------------------------------
+
+  #pageSettings(saved = false): Response {
+    const cfg = this.configuration_();
+
+    const sections: Array<{
+      title: string;
+      note?: string;
+      fields: Array<{ key: string; label: string; type: "text" | "number" | "password" | "checkbox"; hint?: string }>;
+    }> = [
+      {
+        title: "Classifier",
+        fields: [
+          { key: "classifier_unclassified_weight", label: "Unclassified weight", type: "number",
+            hint: "Higher = more messages fall through as unclassified (default 100)" },
+          { key: "GLOBAL_message_cutoff", label: "Message size cutoff (chars)", type: "number",
+            hint: "Body text beyond this limit is ignored (default 100000)" },
+          { key: "GLOBAL_session_timeout", label: "Session timeout (seconds)", type: "number",
+            hint: "How long a non-admin session stays valid (default 1800)" },
+        ],
+      },
+      {
+        title: "POP3 proxy",
+        note: "Requires restart to take effect.",
+        fields: [
+          { key: "pop3_port",  label: "Listen port",        type: "number", hint: "Default 1110" },
+          { key: "pop3_local", label: "Localhost only",     type: "checkbox" },
+        ],
+      },
+      {
+        title: "POP3S proxy",
+        note: "Requires restart to take effect.",
+        fields: [
+          { key: "pop3s_port", label: "Listen port", type: "number", hint: "Default 1995" },
+        ],
+      },
+      {
+        title: "SMTP proxy",
+        note: "Set upstream server to enable. Requires restart to take effect.",
+        fields: [
+          { key: "smtp_server",      label: "Upstream server",      type: "text",     hint: "Hostname — leave empty to disable" },
+          { key: "smtp_server_port", label: "Upstream port",        type: "number",   hint: "Default 25" },
+          { key: "smtp_tls",         label: "Upstream TLS",         type: "checkbox" },
+          { key: "smtp_port",        label: "Listen port",          type: "number",   hint: "Default 1025" },
+          { key: "smtp_local",       label: "Localhost only",       type: "checkbox" },
+        ],
+      },
+      {
+        title: "IMAP service",
+        note: "Set server to enable. Changes to server/credentials take effect on the next poll cycle.",
+        fields: [
+          { key: "imap_server",        label: "Server",               type: "text",     hint: "Hostname — leave empty to disable" },
+          { key: "imap_port",          label: "Port",                 type: "number",   hint: "Default 143 (use 993 with TLS)" },
+          { key: "imap_tls",           label: "TLS",                  type: "checkbox" },
+          { key: "imap_username",      label: "Username",             type: "text" },
+          { key: "imap_password",      label: "Password",             type: "password" },
+          { key: "imap_watch_folder",  label: "Watch folder",         type: "text",     hint: "Default INBOX" },
+          { key: "imap_move",          label: "Move to bucket folders", type: "checkbox" },
+          { key: "imap_folder_prefix", label: "Folder prefix",        type: "text",     hint: "Prepended to bucket name, e.g. POPFile" },
+          { key: "imap_interval",      label: "Poll interval (seconds)", type: "number", hint: "Default 60" },
+        ],
+      },
+      {
+        title: "Web UI",
+        note: "Requires restart to take effect.",
+        fields: [
+          { key: "ui_port",  label: "Listen port",    type: "number", hint: "Default 8080" },
+          { key: "ui_local", label: "Localhost only", type: "checkbox" },
+        ],
+      },
+      {
+        title: "Logging",
+        fields: [
+          { key: "logger_log_level", label: "Log level", type: "number",
+            hint: "0 = errors only, 1 = verbose, 2 = debug" },
+        ],
+      },
+    ];
+
+    const sectionHtml = sections.map(({ title, note, fields }) => {
+      const fieldHtml = fields.map(({ key, label, type, hint }) => {
+        const val = cfg.parameter(key);
+        let input: string;
+        if (type === "checkbox") {
+          const checked = val === "1" ? " checked" : "";
+          input = `<input type="checkbox" name="${esc(key)}" value="1"${checked} style="width:auto;margin-top:4px">`;
+        } else {
+          input = `<input type="${type}" name="${esc(key)}" value="${esc(type === "password" ? "" : val)}"
+            ${type === "number" ? 'style="width:120px"' : 'style="width:320px"'} autocomplete="off">`;
+        }
+        return `<div style="display:flex;align-items:flex-start;gap:16px;margin-bottom:14px">
+          <label style="min-width:220px;font-size:.9rem;padding-top:6px">${esc(label)}</label>
+          <div>
+            ${input}
+            ${hint ? `<div style="font-size:.78rem;color:#888;margin-top:3px">${esc(hint)}</div>` : ""}
+          </div>
+        </div>`;
+      }).join("");
+
+      return `<fieldset style="border:1px solid #ddd;border-radius:8px;padding:16px 20px;margin-bottom:20px">
+        <legend style="font-weight:500;padding:0 6px;font-size:.95rem">${esc(title)}</legend>
+        ${note ? `<p style="font-size:.82rem;color:#888;margin-bottom:14px">${esc(note)}</p>` : ""}
+        ${fieldHtml}
+      </fieldset>`;
+    }).join("");
+
+    const savedBanner = saved
+      ? `<div class="success" style="margin-bottom:16px">Settings saved. Some changes require a restart to take effect.</div>`
+      : "";
+
+    const body = `
+      <h2>Settings</h2>
+      ${savedBanner}
+      <form method="POST" action="/settings">
+        ${sectionHtml}
+        <button class="btn-primary" style="margin-top:4px">Save settings</button>
+      </form>`;
+    return this.#htmlPage("Settings", body);
+  }
+
+  async #doSettings(req: Request): Promise<Response> {
+    const form = await req.formData();
+    const cfg = this.configuration_();
+
+    const allKeys = [
+      "classifier_unclassified_weight",
+      "GLOBAL_message_cutoff",
+      "GLOBAL_session_timeout",
+      "pop3_port", "pop3_local",
+      "pop3s_port",
+      "smtp_server", "smtp_server_port", "smtp_tls", "smtp_port", "smtp_local",
+      "imap_server", "imap_port", "imap_tls", "imap_username", "imap_password",
+      "imap_watch_folder", "imap_move", "imap_folder_prefix", "imap_interval",
+      "ui_port", "ui_local",
+      "logger_log_level",
+    ];
+
+    const checkboxKeys = new Set([
+      "pop3_local", "smtp_tls", "smtp_local",
+      "imap_tls", "imap_move", "ui_local",
+    ]);
+
+    for (const key of allKeys) {
+      if (checkboxKeys.has(key)) {
+        // Unchecked checkbox → absent from form data → "0"
+        cfg.parameter(key, form.has(key) ? "1" : "0");
+      } else {
+        const val = (form.get(key) as string | null)?.trim();
+        if (val !== null && val !== undefined) {
+          // Skip empty password field — keeps existing value
+          if (key === "imap_password" && val === "") continue;
+          cfg.parameter(key, val);
+        }
+      }
+    }
+
+    return this.#pageSettings(true);
+  }
+
   #html404(): Response {
     return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
@@ -628,6 +791,7 @@ export class UIServer extends Module {
       ["Word scores", "/wordscores"],
       ["Train", "/train"],
       ["History", "/history"],
+      ["Settings", "/settings"],
     ].map(([label, href]) => `<a href="${href}">${label}</a>`).join(" | ");
 
     const html = `<!DOCTYPE html>
