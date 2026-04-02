@@ -34,6 +34,8 @@ export class POP3Proxy extends Module {
     this.config_("local", "1");
     this.config_("separator", ":");
     this.config_("welcome_string", "POP3 POPFile proxy ready");
+    this.config_("tls_upstream", "0");
+    this.config_("upstream_port", "110");
     return LifecycleResult.Ok;
   }
 
@@ -127,11 +129,14 @@ export class POP3Proxy extends Module {
             continue;
           }
           const [user, host, portStr] = parts;
-          const port = portStr ? parseInt(portStr, 10) : 110;
+          const port = portStr ? parseInt(portStr, 10) : parseInt(this.config_("upstream_port"), 10);
+          const useTls = this.config_("tls_upstream") === "1" || port === 995;
 
           // Connect to real server
           try {
-            mail = await Deno.connect({ hostname: host, port });
+            mail = useTls
+              ? await Deno.connectTls({ hostname: host, port })
+              : await Deno.connect({ hostname: host, port });
             // Read server banner
             const serverReader = this.#makeLineReader(mail);
             const banner = await serverReader();

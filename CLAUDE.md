@@ -80,6 +80,14 @@ Set these environment variables (or config keys) to enable:
 
 When `imap_move=1`, each classified message is copied to a folder named after its bucket (e.g. `spam`, `inbox`), then deleted from the watch folder. Folders are created automatically.
 
+### POP3S proxy
+
+Listens on port **1995** (or `POPFILE_POP3S_PORT`). Connects to the upstream server with TLS. Configure your mail client to connect to `127.0.0.1:1995` with **no encryption** (POPFile handles TLS to the real server).
+
+Username format: `youruser:realserver.com` or `youruser:realserver.com:995`
+
+If no port is given, defaults to upstream port **995**. TLS is also auto-enabled when the upstream port is 995.
+
 ### Not yet ported
 
 `Proxy::NNTP`, `Proxy::SMTP`, `Proxy::POP3S`, `Services::IMAP`, `UI::XMLRPC`, multi-user UI, history page, bucket colours, CJK tokenisation. Each maps 1:1 to a Perl module and can be added without touching core infrastructure.
