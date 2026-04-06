@@ -612,3 +612,208 @@ Deno.test("Bayes: getStats — accuracy proxy via retrain rate", async () => {
     );
   } finally { await Deno.remove(f); cleanup(); }
 });
+
+// ---------------------------------------------------------------------------
+// classifyWithWordScores
+// ---------------------------------------------------------------------------
+
+Deno.test("Bayes: classifyWithWordScores — no buckets returns empty wordScores", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const f = await makeEml("Subject: test\r\n\r\nbuy cheap drugs");
+  try {
+    const r = bayes.classifyWithWordScores(session, f);
+    assertEquals(r.bucket, "unclassified");
+    assertEquals(r.wordScores, []);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — one bucket returns empty wordScores", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: test\r\n\r\nbuy cheap drugs");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.trainMessage(session, "spam",
+      parser.parse("Subject: s\r\n\r\nbuy cheap drugs online"));
+    const r = bayes.classifyWithWordScores(session, f);
+    assertEquals(r.wordScores, []);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — untrained words absent from wordScores", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  // "zzznever" appears in the message but was never trained
+  const f = await makeEml("Subject: test\r\n\r\nbuy cheap drugs zzznever");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "spam",
+      parser.parse("Subject: s\r\n\r\nbuy cheap drugs online now free"));
+    bayes.trainMessage(session, "inbox",
+      parser.parse("Subject: h\r\n\r\nmeeting agenda tuesday review"));
+    const r = bayes.classifyWithWordScores(session, f);
+    assert(!r.wordScores.some((ws) => ws.word === "zzznever"),
+      "untrained word should not appear in wordScores");
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — bucketProbs are P(word|bucket) not log", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  // Train "spam" bucket with "buy" appearing 4 times total across 2 messages (2+2)
+  // and "inbox" with no "buy" → P(buy|spam) = 2/total_spam_words, P(buy|inbox) = 0
+  const f = await makeEml("Subject: test\r\n\r\nbuy cheap");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "spam",
+      parser.parse("Subject: s\r\n\r\nbuy buy cheap cheap drugs online"));
+    bayes.trainMessage(session, "inbox",
+      parser.parse("Subject: h\r\n\r\nmeeting agenda tuesday review thursday"));
+
+    const r = bayes.classifyWithWordScores(session, f);
+    const buyScore = r.wordScores.find((ws) => ws.word === "buy");
+    assert(buyScore !== undefined, "should have a score for 'buy'");
+
+    const spamProb  = buyScore!.bucketProbs.get("spam")  ?? 0;
+    const inboxProb = buyScore!.bucketProbs.get("inbox") ?? 0;
+
+    // Probability must be in [0, 1] — not a log-probability
+    assert(spamProb  >= 0 && spamProb  <= 1, `spam prob ${spamProb} out of range`);
+    assert(inboxProb >= 0 && inboxProb <= 1, `inbox prob ${inboxProb} out of range`);
+    assert(spamProb > inboxProb, "buy should be more probable in spam than inbox");
+    assertEquals(inboxProb, 0, "buy never trained in inbox → prob should be 0");
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — topBucket is bucket with highest prob", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: buy now\r\n\r\nbuy cheap viagra online discount");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of [
+      "buy cheap viagra online now free shipping discount pills",
+      "make money fast work from home guaranteed income cash prize",
+    ]) bayes.trainMessage(session, "spam",  parser.parse(`Subject: t\r\n\r\n${t}`));
+    for (const t of [
+      "meeting agenda for tuesday please review the attached document",
+      "project update the deadline has been moved to next friday morning",
+    ]) bayes.trainMessage(session, "inbox", parser.parse(`Subject: t\r\n\r\n${t}`));
+
+    const r = bayes.classifyWithWordScores(session, f);
+    assert(r.wordScores.length > 0);
+    // Every spam-exclusive word should have topBucket = "spam"
+    for (const ws of r.wordScores) {
+      const maxProb = Math.max(...ws.bucketProbs.values());
+      const expected = [...ws.bucketProbs.entries()]
+        .find(([, p]) => p === maxProb)![0];
+      assertEquals(ws.topBucket, expected,
+        `topBucket for "${ws.word}" should be "${expected}", got "${ws.topBucket}"`);
+    }
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — sorted by discriminativeness descending", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: buy now\r\n\r\nbuy cheap viagra online discount meeting agenda");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of [
+      "buy cheap viagra online now free shipping discount pills",
+      "make money fast work from home guaranteed income cash prize",
+      "congratulations winner lottery prize claim your cash reward now",
+    ]) bayes.trainMessage(session, "spam",  parser.parse(`Subject: t\r\n\r\n${t}`));
+    for (const t of [
+      "meeting agenda for tuesday please review the attached document",
+      "project update the deadline has been moved to next friday morning",
+      "lunch plans are you free thursday afternoon at the usual place",
+    ]) bayes.trainMessage(session, "inbox", parser.parse(`Subject: t\r\n\r\n${t}`));
+
+    const r = bayes.classifyWithWordScores(session, f);
+    assert(r.wordScores.length >= 2);
+
+    const disc = (ws: typeof r.wordScores[0]) =>
+      (Math.max(...ws.bucketProbs.values()) - Math.min(...ws.bucketProbs.values())) * ws.freq;
+
+    for (let i = 0; i + 1 < r.wordScores.length; i++) {
+      assert(
+        disc(r.wordScores[i]) >= disc(r.wordScores[i + 1]),
+        `word "${r.wordScores[i].word}" (disc=${disc(r.wordScores[i]).toFixed(6)}) should not be less discriminating than "${r.wordScores[i+1].word}" (disc=${disc(r.wordScores[i+1]).toFixed(6)})`,
+      );
+    }
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — topN limits result length", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml(
+    "Subject: buy now\r\n\r\nbuy cheap viagra online discount meeting agenda tuesday review"
+  );
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of [
+      "buy cheap viagra online now free shipping discount pills",
+      "make money fast work from home guaranteed income cash prize",
+    ]) bayes.trainMessage(session, "spam",  parser.parse(`Subject: t\r\n\r\n${t}`));
+    for (const t of [
+      "meeting agenda for tuesday please review the attached document",
+      "project update the deadline has been moved to next friday morning",
+    ]) bayes.trainMessage(session, "inbox", parser.parse(`Subject: t\r\n\r\n${t}`));
+
+    const r3 = bayes.classifyWithWordScores(session, f, 3);
+    assert(r3.wordScores.length <= 3, `topN=3 should return at most 3 words, got ${r3.wordScores.length}`);
+
+    const r1 = bayes.classifyWithWordScores(session, f, 1);
+    assert(r1.wordScores.length <= 1);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — writes history", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: buy drugs\r\n\r\nbuy cheap drugs online");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "spam",
+      parser.parse("Subject: s\r\n\r\nbuy cheap drugs online now free"));
+    bayes.trainMessage(session, "inbox",
+      parser.parse("Subject: h\r\n\r\nmeeting agenda tuesday review"));
+
+    assertEquals(bayes.getHistory(session).length, 0);
+    bayes.classifyWithWordScores(session, f);
+    assertEquals(bayes.getHistory(session).length, 1);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: classifyWithWordScores — result matches classify", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: buy now\r\n\r\nbuy cheap viagra online free shipping discount");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of [
+      "buy cheap viagra online now free shipping discount pills",
+      "make money fast work from home guaranteed income cash prize",
+      "congratulations winner lottery prize claim your cash reward now",
+    ]) bayes.trainMessage(session, "spam",  parser.parse(`Subject: t\r\n\r\n${t}`));
+    for (const t of [
+      "meeting agenda for tuesday please review the attached document",
+      "project update the deadline has been moved to next friday morning",
+      "lunch plans are you free thursday afternoon at the usual place",
+    ]) bayes.trainMessage(session, "inbox", parser.parse(`Subject: t\r\n\r\n${t}`));
+
+    const r1 = bayes.classify(session, f);
+    const r2 = bayes.classifyWithWordScores(session, f);
+    assertEquals(r2.bucket, r1.bucket);
+    assertEquals(r2.magnetUsed, r1.magnetUsed);
+  } finally { await Deno.remove(f); cleanup(); }
+});
