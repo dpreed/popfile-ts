@@ -6,7 +6,7 @@
  *     src/tests/bayes_test.ts
  */
 
-import { assertEquals, assert, assertThrows } from "jsr:@std/assert";
+import { assertEquals, assert, assertThrows, assertAlmostEquals } from "jsr:@std/assert";
 import { Configuration } from "../core/Configuration.ts";
 import { MessageQueue } from "../core/MessageQueue.ts";
 import { Logger } from "../core/Logger.ts";
@@ -413,5 +413,202 @@ Deno.test("Bayes: retrainHistory corrects the bucket", async () => {
     const [updated] = bayes.getHistory(session);
     assertEquals(updated.bucket, "inbox");
     assertEquals(updated.usedtobe, "spam"); // old bucket recorded
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+Deno.test("Bayes: getStats — empty database", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    const s = bayes.getStats(session);
+    assertEquals(s.totalClassified, 0);
+    assertEquals(s.totalRetrained, 0);
+    assertEquals(s.magnetHits, 0);
+    assertEquals(s.totalWords, 0);
+    assertEquals(s.buckets, []);
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: getStats — word counts match training", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.createBucket(session, "spam");
+    bayes.trainMessage(session, "spam",
+      parser.parse("Subject: test\r\n\r\nbuy cheap drugs online now free"));
+    bayes.trainMessage(session, "inbox",
+      parser.parse("Subject: test\r\n\r\nmeeting agenda tuesday review"));
+
+    const s = bayes.getStats(session);
+    assertEquals(s.buckets.length, 2);
+
+    const spamStat = s.buckets.find((b) => b.name === "spam")!;
+    const inboxStat = s.buckets.find((b) => b.name === "inbox")!;
+    assert(spamStat !== undefined);
+    assert(inboxStat !== undefined);
+    assertEquals(spamStat.wordCount, bayes.getBucketWordCount(session, "spam"));
+    assertEquals(inboxStat.wordCount, bayes.getBucketWordCount(session, "inbox"));
+    assertEquals(s.totalWords, spamStat.wordCount + inboxStat.wordCount);
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: getStats — totalClassified increments on classify", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: buy drugs\r\n\r\nbuy cheap drugs online");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "spam",
+      parser.parse("Subject: s\r\n\r\nbuy cheap drugs online now free"));
+    bayes.trainMessage(session, "inbox",
+      parser.parse("Subject: h\r\n\r\nmeeting agenda tuesday review"));
+
+    assertEquals(bayes.getStats(session).totalClassified, 0);
+    bayes.classify(session, f);
+    assertEquals(bayes.getStats(session).totalClassified, 1);
+    bayes.classify(session, f);
+    assertEquals(bayes.getStats(session).totalClassified, 2);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: getStats — classifiedCount per bucket", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const spamTexts = [
+    "buy cheap viagra online now free shipping discount pills",
+    "make money fast work from home guaranteed income cash prize",
+    "congratulations winner lottery prize claim your cash reward now",
+  ];
+  const inboxTexts = [
+    "meeting agenda for tuesday please review the attached document",
+    "project update the deadline has been moved to next friday morning",
+    "lunch plans are you free thursday afternoon at the usual place",
+  ];
+  const spamEml  = await makeEml("Subject: buy now\r\n\r\nbuy cheap viagra online free shipping discount");
+  const inboxEml = await makeEml("Subject: meeting\r\n\r\nplease review the agenda for tuesday afternoon meeting");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of spamTexts)
+      bayes.trainMessage(session, "spam",  parser.parse(`Subject: t\r\n\r\n${t}`));
+    for (const t of inboxTexts)
+      bayes.trainMessage(session, "inbox", parser.parse(`Subject: t\r\n\r\n${t}`));
+
+    bayes.classify(session, spamEml);
+    bayes.classify(session, inboxEml);
+
+    const s = bayes.getStats(session);
+    const spamStat  = s.buckets.find((b) => b.name === "spam")!;
+    const inboxStat = s.buckets.find((b) => b.name === "inbox")!;
+    assertEquals(spamStat.classifiedCount,  1);
+    assertEquals(inboxStat.classifiedCount, 1);
+    assertEquals(s.totalClassified, 2);
+  } finally {
+    await Deno.remove(spamEml);
+    await Deno.remove(inboxEml);
+    cleanup();
+  }
+});
+
+Deno.test("Bayes: getStats — totalRetrained increments on retrainHistory", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: buy now\r\n\r\nbuy cheap viagra online free shipping discount");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of [
+      "buy cheap viagra online now free shipping discount pills",
+      "make money fast work from home guaranteed income cash prize",
+    ]) bayes.trainMessage(session, "spam",  parser.parse(`Subject: t\r\n\r\n${t}`));
+    for (const t of [
+      "meeting agenda for tuesday please review the attached document",
+      "project update the deadline has been moved to next friday morning",
+    ]) bayes.trainMessage(session, "inbox", parser.parse(`Subject: t\r\n\r\n${t}`));
+
+    bayes.classify(session, f);
+    assertEquals(bayes.getStats(session).totalRetrained, 0);
+
+    const [entry] = bayes.getHistory(session);
+    bayes.retrainHistory(session, entry.id, "inbox");
+    assertEquals(bayes.getStats(session).totalRetrained, 1);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: getStats — magnetHits increments when magnet fires", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml(
+    "From: boss@company.com\r\nSubject: quarterly report\r\n\r\nbuy cheap drugs"
+  );
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "spam",
+      parser.parse("Subject: s\r\n\r\nbuy cheap drugs online now free"));
+    bayes.trainMessage(session, "inbox",
+      parser.parse("Subject: h\r\n\r\nmeeting agenda tuesday review"));
+    bayes.addMagnet(session, "inbox", "from", "boss@company.com");
+
+    assertEquals(bayes.getStats(session).magnetHits, 0);
+    bayes.classify(session, f);
+    assertEquals(bayes.getStats(session).magnetHits, 1);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: getStats — default bucket colour is black", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createBucket(session, "spam");
+    const s = bayes.getStats(session);
+    assertEquals(s.buckets[0].color, "black");
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: getStats — bucket colour reflects setBucketColor", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.setBucketColor(session, "spam", "#ff0000");
+    const s = bayes.getStats(session);
+    assertEquals(s.buckets[0].color, "#ff0000");
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: getStats — accuracy proxy via retrain rate", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: buy now\r\n\r\nbuy cheap viagra online free shipping discount");
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of [
+      "buy cheap viagra online now free shipping discount pills",
+      "make money fast work from home guaranteed income cash prize",
+    ]) bayes.trainMessage(session, "spam",  parser.parse(`Subject: t\r\n\r\n${t}`));
+    for (const t of [
+      "meeting agenda for tuesday please review the attached document",
+      "project update the deadline has been moved to next friday morning",
+    ]) bayes.trainMessage(session, "inbox", parser.parse(`Subject: t\r\n\r\n${t}`));
+
+    // Classify twice, retrain once → accuracy = 50%
+    bayes.classify(session, f);
+    bayes.classify(session, f);
+    const [, entry] = bayes.getHistory(session); // older entry
+    bayes.retrainHistory(session, entry.id, "inbox");
+
+    const s = bayes.getStats(session);
+    assertEquals(s.totalClassified, 2);
+    assertEquals(s.totalRetrained, 1);
+    assertAlmostEquals(
+      (s.totalClassified - s.totalRetrained) / s.totalClassified,
+      0.5,
+      0.001,
+    );
   } finally { await Deno.remove(f); cleanup(); }
 });

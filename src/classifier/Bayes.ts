@@ -73,6 +73,11 @@ interface Bucket {
   pseudo: boolean;
 }
 
+// Internal extended result — carries the matched magnet ID for history storage
+interface ClassifyResultInternal extends ClassifyResult {
+  magnetId: number | null;
+}
+
 interface MagnetRow {
   id: number;
   type: string;   // "from" | "to" | "subject" | "cc"
@@ -343,12 +348,13 @@ export class Bayes extends Module {
   }
 
   /** Classify an already-parsed message (used internally). */
-  classifyParsed(userId: number, parsed: ParseResult): ClassifyResult {
+  classifyParsed(userId: number, parsed: ParseResult): ClassifyResultInternal {
     const buckets = this.#getBuckets(userId);
-    const emptyResult: ClassifyResult = {
+    const emptyResult: ClassifyResultInternal = {
       bucket: "unclassified",
       scores: new Map(),
       magnetUsed: false,
+      magnetId: null,
     };
 
     if (buckets.length === 0) return emptyResult;
@@ -356,7 +362,12 @@ export class Bayes extends Module {
     // 1. Magnet check — explicit rules override Bayes
     const magnetMatch = this.#checkMagnets(userId, parsed);
     if (magnetMatch) {
-      return { bucket: magnetMatch, scores: new Map([[magnetMatch, 1]]), magnetUsed: true };
+      return {
+        bucket: magnetMatch.bucket,
+        scores: new Map([[magnetMatch.bucket, 1]]),
+        magnetUsed: true,
+        magnetId: magnetMatch.magnetId,
+      };
     }
 
     // 2. Need at least 2 buckets with words to classify
@@ -453,7 +464,7 @@ export class Bayes extends Module {
       normalizedScores.set(name, Math.min(0.999999, v / total));
     }
 
-    return { bucket: winningBucket, scores: normalizedScores, magnetUsed: false };
+    return { bucket: winningBucket, scores: normalizedScores, magnetUsed: false, magnetId: null };
   }
 
   // -------------------------------------------------------------------------
@@ -577,7 +588,7 @@ export class Bayes extends Module {
     const rows = db.prepare(`
       SELECT b.name,
              COALESCE(SUM(m.times), 0)                       AS words,
-             COUNT(h.id)                                      AS classified,
+             COUNT(DISTINCT h.id)                             AS classified,
              COALESCE(bp.val, bt.def)                         AS color
       FROM   buckets b
       JOIN   bucket_template bt ON bt.name = 'color'
@@ -694,17 +705,18 @@ export class Bayes extends Module {
     }
   }
 
-  #writeHistory(userId: number, filePath: string, parsed: ParseResult, result: ClassifyResult): void {
+  #writeHistory(userId: number, filePath: string, parsed: ParseResult, result: ClassifyResultInternal): void {
     const db = this.db_();
     const bucket = result.bucket !== "unclassified"
       ? this.#getBucketByName(userId, result.bucket)
       : null;
     db.exec(
-      `INSERT INTO history (userid, filename, bucketid, date, from_address, to_address, subject, inserted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+      `INSERT INTO history (userid, filename, bucketid, magnetid, date, from_address, to_address, subject, inserted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
       userId,
       filePath,
       bucket?.id ?? null,
+      result.magnetId ?? null,
       Math.floor(Date.now() / 1000),
       parsed.headers.get("from") ?? "",
       parsed.headers.get("to") ?? "",
@@ -727,20 +739,20 @@ export class Bayes extends Module {
     this.#updateConstants(userId);
   }
 
-  #checkMagnets(userId: number, parsed: ParseResult): string | null {
+  #checkMagnets(userId: number, parsed: ParseResult): { bucket: string; magnetId: number } | null {
     const db = this.db_();
     const rows = db.prepare(
-      `SELECT mg.val, mt.name AS type, b.name AS bucket
+      `SELECT mg.id, mg.val, mt.name AS type, b.name AS bucket
        FROM magnets mg
        JOIN magnet_types mt ON mg.mtid=mt.id
        JOIN buckets b ON mg.bucketid=b.id
        WHERE b.userid=?`
-    ).values<[string, string, string]>(userId);
+    ).values<[number, string, string, string]>(userId);
 
-    for (const [val, type, bucket] of rows) {
+    for (const [magnetId, val, type, bucket] of rows) {
       const headerValue = parsed.headers.get(type.toLowerCase()) ?? "";
       if (headerValue.toLowerCase().includes(val.toLowerCase())) {
-        return bucket;
+        return { bucket, magnetId };
       }
     }
     return null;
