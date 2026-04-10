@@ -101,7 +101,8 @@ async function makeUIStack(existingTmpDir?: string): Promise<UIStack> {
     }
     // Give the server a moment to shut down
     await new Promise((r) => setTimeout(r, 10));
-    Deno.removeSync(tmpDir, { recursive: true });
+    // Only remove the directory if this stack created it
+    if (!existingTmpDir) Deno.removeSync(tmpDir, { recursive: true });
   };
 
   return { ui, bayes, session, baseUrl, cookie, csrf, tmpDir, cleanup };
@@ -1314,4 +1315,44 @@ Deno.test("UIServer: mutation routes return 403 without valid CSRF token", async
       assertEquals(res2.status, 403, `Expected 403 for ${path} with wrong CSRF token`);
     }
   } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// popfile.cfg round-trip via UI: POST /settings → stop → restart → value restored
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: settings saved via POST /settings survive a restart", async () => {
+  const tmpDir = await Deno.makeTempDir();
+  try {
+    // First run: change a setting through the UI
+    {
+      const { baseUrl, cookie, csrf, cleanup } = await makeUIStack(tmpDir);
+      try {
+        const form = new URLSearchParams({ classifier_unclassified_weight: "42" });
+        const res = await post(baseUrl, "/settings", form, cookie, csrf);
+        assertEquals(res.status, 200, "Expected settings page after save");
+        await res.body?.cancel();
+      } finally {
+        await cleanup(); // triggers Configuration.stop() → writes popfile.cfg
+      }
+    }
+
+    // Second run: new stack on same directory — value must be restored from disk
+    {
+      const { baseUrl, cookie, cleanup } = await makeUIStack(tmpDir);
+      try {
+        const res = await fetch(`${baseUrl}/settings`, {
+          redirect: "manual",
+          headers: { "Cookie": cookie },
+        });
+        assertEquals(res.status, 200);
+        const body = await res.text();
+        assert(body.includes("42"), "Saved setting should appear in the settings page after restart");
+      } finally {
+        await cleanup();
+      }
+    }
+  } finally {
+    Deno.removeSync(tmpDir, { recursive: true });
+  }
 });
