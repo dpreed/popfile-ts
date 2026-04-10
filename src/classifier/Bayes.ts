@@ -152,14 +152,25 @@ export class Bayes extends Module {
   /**
    * Authenticate directly against the users table (no accounts JOIN).
    * Returns a session key on success, null on failure.
+   * Transparently migrates legacy plaintext passwords to PBKDF2 on successful login.
    */
-  loginUser(username: string, password: string): string | null {
+  async loginUser(username: string, password: string): Promise<string | null> {
     const db = this.db_();
     const row = db.prepare(
-      "SELECT id FROM users WHERE name=? AND password=?"
-    ).value<[number]>(username, password);
+      "SELECT id, password FROM users WHERE name=?"
+    ).value<[number, string]>(username);
     if (!row) return null;
-    const userId = row[0];
+    const [userId, stored] = row;
+
+    const ok = await this.#verifyPassword(password, stored);
+    if (!ok) return null;
+
+    // Migrate plaintext password to PBKDF2 on first successful login
+    if (!stored.startsWith("pbkdf2:")) {
+      const hashed = await this.#hashPassword(password);
+      db.exec("UPDATE users SET password=? WHERE id=?", hashed, userId);
+    }
+
     const key = this.#generateSessionKey();
     const timeout = parseInt(this.globalConfig_("session_timeout"), 10) * 1000;
     this.#sessions.set(key, { userId, expires: Date.now() + timeout });
@@ -190,9 +201,10 @@ export class Bayes extends Module {
   }
 
   /** Create a new user (admin only). */
-  createUserAccount(adminSession: string, username: string, password: string): void {
+  async createUserAccount(adminSession: string, username: string, password: string): Promise<void> {
     if (!this.isAdmin(adminSession)) throw new Error("Admin access required");
-    this.db_().exec("INSERT INTO users (name, password) VALUES (?,?)", username, password);
+    const hashed = await this.#hashPassword(password);
+    this.db_().exec("INSERT INTO users (name, password) VALUES (?,?)", username, hashed);
   }
 
   /** Delete a user (admin only; cannot delete admin). */
@@ -203,10 +215,11 @@ export class Bayes extends Module {
   }
 
   /** Change a user's own password. */
-  setPassword(sessionKey: string, newPassword: string): void {
+  async setPassword(sessionKey: string, newPassword: string): Promise<void> {
     const userId = this.#validSession(sessionKey);
     if (userId === null) throw new Error("Invalid session key");
-    this.db_().exec("UPDATE users SET password=? WHERE id=?", newPassword, userId);
+    const hashed = await this.#hashPassword(newPassword);
+    this.db_().exec("UPDATE users SET password=? WHERE id=?", hashed, userId);
   }
 
   getAdministratorSessionKey(): string {
@@ -227,6 +240,15 @@ export class Bayes extends Module {
     this.#sessions.delete(key);
   }
 
+  /** Returns true if the user's current stored password is a hash of the empty string. */
+  async isDefaultPassword(sessionKey: string): Promise<boolean> {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) return false;
+    const row = this.db_().prepare("SELECT password FROM users WHERE id=?").value<[string]>(userId);
+    if (!row) return false;
+    return await this.#verifyPassword("", row[0]);
+  }
+
   #validSession(key: string): number | null {
     const s = this.#sessions.get(key);
     if (!s) return null;
@@ -245,6 +267,36 @@ export class Bayes extends Module {
     const buf = new Uint8Array(32);
     crypto.getRandomValues(buf);
     return Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  async #hashPassword(password: string): Promise<string> {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt, iterations: 100_000 },
+      key, 256
+    );
+    const toHex = (b: Uint8Array) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+    return `pbkdf2:100000:${toHex(salt)}:${toHex(new Uint8Array(bits))}`;
+  }
+
+  async #verifyPassword(password: string, stored: string): Promise<boolean> {
+    if (!stored.startsWith("pbkdf2:")) return password === stored;
+    const parts = stored.split(":");
+    if (parts.length !== 4) return false;
+    const iterations = parseInt(parts[1], 10);
+    const salt = new Uint8Array(parts[2].match(/.{2}/g)!.map((h) => parseInt(h, 16)));
+    const key = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+      key, 256
+    );
+    const hashHex = Array.from(new Uint8Array(bits)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    return hashHex === parts[3];
   }
 
   // -------------------------------------------------------------------------

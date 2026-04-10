@@ -31,6 +31,7 @@ interface UIStack {
   session: string;
   baseUrl: string;
   cookie: string;
+  csrf: string;
   tmpDir: string;
   cleanup: () => Promise<void>;
 }
@@ -78,6 +79,15 @@ async function makeUIStack(existingTmpDir?: string): Promise<UIStack> {
   const setCookie = loginRes.headers.get("set-cookie") ?? "";
   const cookie = setCookie.split(";")[0]; // e.g. "popfile_session=<token>"
 
+  // Extract CSRF token from an authenticated page
+  const statsRes = await fetch(`${baseUrl}/stats`, {
+    redirect: "manual",
+    headers: { "Cookie": cookie },
+  });
+  const statsHtml = await statsRes.text();
+  const csrfMatch = /<meta name="csrf-token" content="([^"]+)"/.exec(statsHtml);
+  const csrf = csrfMatch?.[1] ?? "";
+
   const cleanup = async () => {
     bayes.releaseSessionKey(session);
     for (const alias of [...modules].reverse()) {
@@ -88,7 +98,7 @@ async function makeUIStack(existingTmpDir?: string): Promise<UIStack> {
     Deno.removeSync(tmpDir, { recursive: true });
   };
 
-  return { ui, bayes, session, baseUrl, cookie, tmpDir, cleanup };
+  return { ui, bayes, session, baseUrl, cookie, csrf, tmpDir, cleanup };
 }
 
 // ---------------------------------------------------------------------------
@@ -107,8 +117,15 @@ async function post(
   path: string,
   body: URLSearchParams | string,
   cookie: string,
+  csrf?: string,
 ): Promise<Response> {
   const isJson = typeof body === "string";
+  let finalBody: URLSearchParams | string = body;
+  if (!isJson && csrf && body instanceof URLSearchParams) {
+    const params = new URLSearchParams(body);
+    params.set("_csrf", csrf);
+    finalBody = params;
+  }
   return await fetch(`${baseUrl}${path}`, {
     method: "POST",
     redirect: "manual",
@@ -116,7 +133,7 @@ async function post(
       "Content-Type": isJson ? "application/json" : "application/x-www-form-urlencoded",
       "Cookie": cookie,
     },
-    body,
+    body: finalBody,
   });
 }
 
@@ -326,7 +343,7 @@ Deno.test("UIServer: GET /history/export respects bucket filter", async () => {
 });
 
 Deno.test("UIServer: POST /history/retrain redirects back to same page", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "inbox");
     bayes.createBucket(session, "spam");
@@ -340,7 +357,7 @@ Deno.test("UIServer: POST /history/retrain redirects back to same page", async (
       bucket: "spam",
       back: "/history?page=2&bucket=inbox",
     });
-    const res = await post(baseUrl, "/history/retrain", form, cookie);
+    const res = await post(baseUrl, "/history/retrain", form, cookie, csrf);
     assert(res.status === 302 || res.status === 303);
     const location = res.headers.get("location") ?? "";
     assert(location.includes("page=2") && location.includes("bucket=inbox"),
@@ -361,11 +378,12 @@ Deno.test("UIServer: GET /classify returns 200 HTML with file upload form", asyn
 });
 
 Deno.test("UIServer: POST /classify with file upload returns classification result", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "inbox");
     bayes.createBucket(session, "spam");
     const formData = new FormData();
+    formData.append("_csrf", csrf);
     formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
     const res = await fetch(`${baseUrl}/classify`, {
       method: "POST",
@@ -382,7 +400,7 @@ Deno.test("UIServer: POST /classify with file upload returns classification resu
 });
 
 Deno.test("UIServer: POST /classify with trained message shows correct bucket", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "spam");
     bayes.createBucket(session, "inbox");
@@ -420,6 +438,7 @@ Deno.test("UIServer: POST /classify with trained message shows correct bucket", 
     }
 
     const formData = new FormData();
+    formData.append("_csrf", csrf);
     formData.append("upload", new File([spamEml], "spam.eml", { type: "message/rfc822" }));
     const res = await fetch(`${baseUrl}/classify`, {
       method: "POST",
@@ -465,9 +484,10 @@ Deno.test("UIServer: GET /wordscores shows file upload form", async () => {
 });
 
 Deno.test("UIServer: POST /wordscores upload redirects to ?id=", async () => {
-  const { baseUrl, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, cookie, csrf, cleanup } = await makeUIStack();
   try {
     const formData = new FormData();
+    formData.append("_csrf", csrf);
     formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
     const res = await fetch(`${baseUrl}/wordscores`, {
       method: "POST",
@@ -483,13 +503,14 @@ Deno.test("UIServer: POST /wordscores upload redirects to ?id=", async () => {
 });
 
 Deno.test("UIServer: GET /wordscores?id= resolves cached file and shows analysis", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "inbox");
     bayes.createBucket(session, "spam");
 
     // Upload via POST to get a cache ID
     const formData = new FormData();
+    formData.append("_csrf", csrf);
     formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
     const postRes = await fetch(`${baseUrl}/wordscores`, {
       method: "POST",
@@ -522,10 +543,11 @@ Deno.test("UIServer: GET /wordscores?id= with invalid id shows error message", a
 });
 
 Deno.test("UIServer: POST /classify word scores link uses ?id= not ?file=", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "inbox");
     const formData = new FormData();
+    formData.append("_csrf", csrf);
     formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
     const res = await fetch(`${baseUrl}/classify`, {
       method: "POST",
@@ -584,10 +606,10 @@ Deno.test("UIServer: GET /api/stats returns JSON with bucket stats", async () =>
 // ---------------------------------------------------------------------------
 
 Deno.test("UIServer: POST /buckets/create creates a bucket and redirects", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     const form = new URLSearchParams({ name: "testbucket" });
-    const res = await post(baseUrl, "/buckets/create", form, cookie);
+    const res = await post(baseUrl, "/buckets/create", form, cookie, csrf);
     // Expect redirect after creation
     assert(res.status === 302 || res.status === 303 || res.status === 200, `Unexpected status ${res.status}`);
     await res.body?.cancel();
@@ -597,11 +619,11 @@ Deno.test("UIServer: POST /buckets/create creates a bucket and redirects", async
 });
 
 Deno.test("UIServer: POST /buckets/delete deletes a bucket and redirects", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "tobedeleted");
     const form = new URLSearchParams({ name: "tobedeleted" });
-    const res = await post(baseUrl, "/buckets/delete", form, cookie);
+    const res = await post(baseUrl, "/buckets/delete", form, cookie, csrf);
     assert(res.status === 302 || res.status === 303 || res.status === 200, `Unexpected status ${res.status}`);
     await res.body?.cancel();
     const buckets = bayes.getBuckets(session);
@@ -610,11 +632,11 @@ Deno.test("UIServer: POST /buckets/delete deletes a bucket and redirects", async
 });
 
 Deno.test("UIServer: POST /buckets/color sets bucket color and redirects", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "colorbucket");
     const form = new URLSearchParams({ name: "colorbucket", color: "#ff0000" });
-    const res = await post(baseUrl, "/buckets/color", form, cookie);
+    const res = await post(baseUrl, "/buckets/color", form, cookie, csrf);
     assert(res.status === 302 || res.status === 303 || res.status === 200, `Unexpected status ${res.status}`);
     await res.body?.cancel();
     const colors = bayes.getBucketColors(session);
@@ -627,11 +649,11 @@ Deno.test("UIServer: POST /buckets/color sets bucket color and redirects", async
 // ---------------------------------------------------------------------------
 
 Deno.test("UIServer: POST /magnets/add adds a magnet and redirects", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "spam");
     const form = new URLSearchParams({ bucket: "spam", type: "from", value: "spammer@evil.com" });
-    const res = await post(baseUrl, "/magnets/add", form, cookie);
+    const res = await post(baseUrl, "/magnets/add", form, cookie, csrf);
     assert(res.status === 302 || res.status === 303 || res.status === 200, `Unexpected status ${res.status}`);
     await res.body?.cancel();
     const magnets = bayes.getMagnets(session);
@@ -640,7 +662,7 @@ Deno.test("UIServer: POST /magnets/add adds a magnet and redirects", async () =>
 });
 
 Deno.test("UIServer: POST /magnets/delete removes a magnet and redirects", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "spam");
     bayes.addMagnet(session, "spam", "from", "delete@me.com");
@@ -648,7 +670,7 @@ Deno.test("UIServer: POST /magnets/delete removes a magnet and redirects", async
     const magnet = before.find((m) => m.val === "delete@me.com");
     assert(magnet !== undefined, "Magnet should exist before delete");
     const form = new URLSearchParams({ id: String(magnet!.id) });
-    const res = await post(baseUrl, "/magnets/delete", form, cookie);
+    const res = await post(baseUrl, "/magnets/delete", form, cookie, csrf);
     assert(res.status === 302 || res.status === 303 || res.status === 200, `Unexpected status ${res.status}`);
     await res.body?.cancel();
     const after = bayes.getMagnets(session);
@@ -684,10 +706,10 @@ Deno.test("UIServer: GET /users returns 200 HTML for admin", async () => {
 });
 
 Deno.test("UIServer: POST /users/create creates a new user", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     const form = new URLSearchParams({ username: "alice", password: "secret" });
-    const res = await post(baseUrl, "/users/create", form, cookie);
+    const res = await post(baseUrl, "/users/create", form, cookie, csrf);
     assert(res.status === 302 || res.status === 303, `Unexpected status ${res.status}`);
     await res.body?.cancel();
     const users = bayes.listUsers(session);
@@ -696,11 +718,11 @@ Deno.test("UIServer: POST /users/create creates a new user", async () => {
 });
 
 Deno.test("UIServer: POST /users/delete removes a user", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
-    bayes.createUserAccount(session, "bob", "pass");
+    await bayes.createUserAccount(session, "bob", "pass");
     const form = new URLSearchParams({ username: "bob" });
-    const res = await post(baseUrl, "/users/delete", form, cookie);
+    const res = await post(baseUrl, "/users/delete", form, cookie, csrf);
     assert(res.status === 302 || res.status === 303, `Unexpected status ${res.status}`);
     await res.body?.cancel();
     const users = bayes.listUsers(session);
@@ -733,12 +755,13 @@ Deno.test("UIServer: GET /train shows file upload form", async () => {
 });
 
 Deno.test("UIServer: POST /train with file upload trains the message", async () => {
-  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
   try {
     bayes.createBucket(session, "inbox");
     const before = bayes.getBucketWordCount(session, "inbox");
 
     const formData = new FormData();
+    formData.append("_csrf", csrf);
     formData.append("bucket", "inbox");
     formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
 
@@ -758,7 +781,7 @@ Deno.test("UIServer: POST /train with file upload trains the message", async () 
 });
 
 Deno.test("UIServer: POST /train/import imports .eml files from training dir", async () => {
-  const { baseUrl, bayes, session, cookie, tmpDir, cleanup } = await makeUIStack();
+  const { baseUrl, bayes, session, cookie, csrf, tmpDir, cleanup } = await makeUIStack();
   try {
     // Create training/spam/ with two .eml files
     await Deno.mkdir(`${tmpDir}/training/spam`, { recursive: true });
@@ -766,11 +789,7 @@ Deno.test("UIServer: POST /train/import imports .eml files from training dir", a
     await Deno.writeTextFile(`${tmpDir}/training/spam/2.eml`, SAMPLE_EML);
 
     const form = new URLSearchParams({ bucket: "spam" });
-    const res = await fetch(`${baseUrl}/train/import`, {
-      method: "POST", redirect: "manual",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie },
-      body: form,
-    });
+    const res = await post(baseUrl, "/train/import", form, cookie, csrf);
     const body = await res.text();
     assertEquals(res.status, 200);
     assert(body.includes("spam"), `Expected spam in result: ${body.substring(0, 300)}`);

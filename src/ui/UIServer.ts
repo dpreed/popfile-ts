@@ -32,6 +32,10 @@ export class UIServer extends Module {
   #server: Deno.HttpServer | null = null;
   /** Maps random UI cookie token → Bayes session key. */
   #browserSessions: Map<string, string> = new Map();
+  /** Maps Bayes session key → CSRF token for that session. */
+  #csrfTokens: Map<string, string> = new Map();
+  /** Bayes session keys whose user still has the default (blank) password. */
+  #needsPasswordChange: Set<string> = new Set();
 
   constructor() {
     super();
@@ -82,6 +86,8 @@ export class UIServer extends Module {
       try { bayes.releaseSessionKey(bayesSession); } catch { /* ok */ }
     }
     this.#browserSessions.clear();
+    this.#csrfTokens.clear();
+    this.#needsPasswordChange.clear();
     super.stop();
   }
 
@@ -139,6 +145,13 @@ export class UIServer extends Module {
     const buf = new Uint8Array(24);
     crypto.getRandomValues(buf);
     return Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  #verifyCsrf(session: string, form: FormData): boolean {
+    const expected = this.#csrfTokens.get(session);
+    if (!expected) return false;
+    const provided = form.get("_csrf");
+    return typeof provided === "string" && provided === expected;
   }
 
   // -------------------------------------------------------------------------
@@ -260,11 +273,15 @@ export class UIServer extends Module {
     const username = (form.get("username") as string | null)?.trim() ?? "";
     const password = (form.get("password") as string | null) ?? "";
 
-    const bayesKey = bayes.loginUser(username, password);
+    const bayesKey = await bayes.loginUser(username, password);
     if (!bayesKey) return this.#pageLogin("Invalid username or password");
 
     const token = this.#generateToken();
     this.#browserSessions.set(token, bayesKey);
+    this.#csrfTokens.set(bayesKey, this.#generateToken());
+    if (await bayes.isDefaultPassword(bayesKey)) {
+      this.#needsPasswordChange.add(bayesKey);
+    }
 
     return new Response(null, {
       status: 303,
@@ -335,10 +352,11 @@ export class UIServer extends Module {
 
   async #createUser(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const username = (form.get("username") as string | null)?.trim() ?? "";
     const password = (form.get("password") as string | null) ?? "";
     if (username) {
-      try { bayes.createUserAccount(session, username, password); } catch (e) {
+      try { await bayes.createUserAccount(session, username, password); } catch (e) {
         this.log_(0, `Create user error: ${e}`);
       }
     }
@@ -347,6 +365,7 @@ export class UIServer extends Module {
 
   async #deleteUser(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const username = (form.get("username") as string | null) ?? "";
     if (username) {
       try { bayes.deleteUserAccount(session, username); } catch (e) {
@@ -358,10 +377,14 @@ export class UIServer extends Module {
 
   async #changePassword(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const password = (form.get("password") as string | null) ?? "";
     const confirm  = (form.get("confirm")  as string | null) ?? "";
     if (password === confirm) {
-      try { bayes.setPassword(session, password); } catch (e) {
+      try {
+        await bayes.setPassword(session, password);
+        this.#needsPasswordChange.delete(session);
+      } catch (e) {
         this.log_(0, `Set password error: ${e}`);
       }
     }
@@ -454,6 +477,7 @@ export class UIServer extends Module {
 
   async #createBucket(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const name = (form.get("name") as string | null)?.trim();
     if (name) bayes.createBucket(session, name);
     return Response.redirect(new URL("/buckets", req.url), 303);
@@ -461,6 +485,7 @@ export class UIServer extends Module {
 
   async #deleteBucket(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const name = form.get("name") as string | null;
     if (name) bayes.deleteBucket(session, name);
     return Response.redirect(new URL("/buckets", req.url), 303);
@@ -468,6 +493,7 @@ export class UIServer extends Module {
 
   async #setBucketColor(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const name = (form.get("name") as string | null)?.trim();
     const color = (form.get("color") as string | null)?.trim();
     if (name && color) bayes.setBucketColor(session, name, color);
@@ -513,6 +539,7 @@ export class UIServer extends Module {
 
   async #addMagnet(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const type = form.get("type") as string;
     const value = (form.get("value") as string)?.trim();
     const bucket = form.get("bucket") as string;
@@ -522,6 +549,7 @@ export class UIServer extends Module {
 
   async #deleteMagnet(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const id = parseInt(form.get("id") as string, 10);
     if (!isNaN(id)) bayes.deleteMagnet(session, id);
     return Response.redirect(new URL("/magnets", req.url), 303);
@@ -546,6 +574,7 @@ export class UIServer extends Module {
 
   async #doClassify(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const buckets = bayes.getBuckets(session);
 
     // Resolve uploaded file or legacy server-path field
@@ -689,6 +718,7 @@ export class UIServer extends Module {
 
   async #doTrain(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const bucket = (form.get("bucket") as string | null)?.trim();
     if (!bucket) return await this.#pageTrain(bayes, session);
 
@@ -740,6 +770,7 @@ export class UIServer extends Module {
 
   async #doTrainImport(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const importAll = form.get("all") === "1";
     const singleBucket = importAll ? null : (form.get("bucket") as string | null)?.trim();
 
@@ -940,6 +971,7 @@ export class UIServer extends Module {
 
   async #doHistoryRetrain(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const id = parseInt(form.get("id") as string, 10);
     const bucket = (form.get("bucket") as string)?.trim();
     const back = (form.get("back") as string | null)?.trim() || "/history";
@@ -1097,6 +1129,7 @@ export class UIServer extends Module {
 
   async #doWordScores(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const upload = form.get("upload");
     if (!(upload instanceof File)) {
       return this.#pageWordScores(bayes, new URL(req.url), session, { error: "No file uploaded." });
@@ -1281,6 +1314,7 @@ export class UIServer extends Module {
 
   async #doSettings(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
+    if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const cfg = this.configuration_();
 
     const allKeys = [
@@ -1330,6 +1364,12 @@ export class UIServer extends Module {
   #htmlPage(title: string, content: string, bayes: Bayes, session: string): Response {
     const isAdmin = bayes.isAdmin(session);
     const username = bayes.getUsername(session) ?? "?";
+    const csrfToken = this.#csrfTokens.get(session) ?? "";
+    const passwordWarning = this.#needsPasswordChange.has(session)
+      ? `<div class="warning" style="margin-bottom:16px">
+           Default password is still in use. <a href="/users" style="color:#7d6608;font-weight:500">Please change it.</a>
+         </div>`
+      : "";
 
     const navLinks = [
       ["Stats", "/stats"],
@@ -1358,6 +1398,7 @@ export class UIServer extends Module {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="${esc(csrfToken)}">
   <title>${esc(title)} — POPFile</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
@@ -1383,6 +1424,7 @@ export class UIServer extends Module {
     .badge{background:#2980b9;color:#fff;font-size:.75rem;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle}
     .error{background:#fdf0ef;border-left:3px solid #c0392b;padding:12px 16px;border-radius:4px;margin-top:12px;color:#c0392b}
     .success{background:#edfaf1;border-left:3px solid #27ae60;padding:12px 16px;border-radius:4px;margin-bottom:16px;color:#1e8449}
+    .warning{background:#fef9e7;border-left:3px solid #f39c12;padding:12px 16px;border-radius:4px;color:#7d6608}
     .train-correction{margin-top:16px;padding-top:12px;border-top:1px solid #eee}
     p{margin-bottom:12px;color:#555;font-size:.9rem}
     code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:.85rem}
@@ -1395,7 +1437,18 @@ export class UIServer extends Module {
     <nav>${navItems}</nav>
     ${userBar}
   </header>
-  <main>${content}</main>
+  <main>${passwordWarning}${content}</main>
+  <script>
+    (function(){
+      var t=document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+      document.querySelectorAll('form').forEach(function(f){
+        if(f.method.toUpperCase()==='POST'){
+          var i=document.createElement('input');
+          i.type='hidden';i.name='_csrf';i.value=t;f.appendChild(i);
+        }
+      });
+    })();
+  </script>
 </body>
 </html>`;
     return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });

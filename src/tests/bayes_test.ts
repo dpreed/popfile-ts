@@ -6,7 +6,7 @@
  *     src/tests/bayes_test.ts
  */
 
-import { assertEquals, assert, assertThrows, assertAlmostEquals } from "jsr:@std/assert";
+import { assertEquals, assert, assertThrows, assertAlmostEquals, assertRejects } from "jsr:@std/assert";
 import { Configuration } from "../core/Configuration.ts";
 import { MessageQueue } from "../core/MessageQueue.ts";
 import { Logger } from "../core/Logger.ts";
@@ -925,7 +925,7 @@ Deno.test("Bayes: classifyWithWordScores — result matches classify", async () 
 Deno.test("Bayes: loginUser returns session key for valid admin credentials", async () => {
   const { bayes, cleanup } = await makeStack();
   try {
-    const key = bayes.loginUser("admin", "");
+    const key = await bayes.loginUser("admin", "");
     assert(key !== null, "Expected a session key");
     // Key should work as a valid session
     assert(Array.isArray(bayes.getBuckets(key!)));
@@ -935,7 +935,7 @@ Deno.test("Bayes: loginUser returns session key for valid admin credentials", as
 Deno.test("Bayes: loginUser returns null for wrong password", async () => {
   const { bayes, cleanup } = await makeStack();
   try {
-    const key = bayes.loginUser("admin", "wrongpassword");
+    const key = await bayes.loginUser("admin", "wrongpassword");
     assertEquals(key, null);
   } finally { cleanup(); }
 });
@@ -943,7 +943,7 @@ Deno.test("Bayes: loginUser returns null for wrong password", async () => {
 Deno.test("Bayes: loginUser returns null for nonexistent user", async () => {
   const { bayes, cleanup } = await makeStack();
   try {
-    const key = bayes.loginUser("nobody", "");
+    const key = await bayes.loginUser("nobody", "");
     assertEquals(key, null);
   } finally { cleanup(); }
 });
@@ -958,8 +958,8 @@ Deno.test("Bayes: isAdmin returns true for admin session", async () => {
 Deno.test("Bayes: isAdmin returns false for non-admin session", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "alice", "pass");
-    const aliceKey = bayes.loginUser("alice", "pass");
+    await bayes.createUserAccount(session, "alice", "pass");
+    const aliceKey = await bayes.loginUser("alice", "pass");
     assert(aliceKey !== null);
     assert(!bayes.isAdmin(aliceKey!));
   } finally { cleanup(); }
@@ -990,7 +990,7 @@ Deno.test("Bayes: listUsers includes admin", async () => {
 Deno.test("Bayes: createUserAccount adds a new user", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "bob", "secret");
+    await bayes.createUserAccount(session, "bob", "secret");
     const users = bayes.listUsers(session);
     assert(users.some((u) => u.name === "bob" && !u.isAdmin));
   } finally { cleanup(); }
@@ -999,9 +999,9 @@ Deno.test("Bayes: createUserAccount adds a new user", async () => {
 Deno.test("Bayes: createUserAccount requires admin session", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "alice", "pass");
-    const aliceKey = bayes.loginUser("alice", "pass")!;
-    assertThrows(
+    await bayes.createUserAccount(session, "alice", "pass");
+    const aliceKey = (await bayes.loginUser("alice", "pass"))!;
+    await assertRejects(
       () => bayes.createUserAccount(aliceKey, "charlie", "pass"),
       Error, "Admin access required",
     );
@@ -1011,8 +1011,8 @@ Deno.test("Bayes: createUserAccount requires admin session", async () => {
 Deno.test("Bayes: new user can log in with correct password", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "carol", "mypass");
-    const key = bayes.loginUser("carol", "mypass");
+    await bayes.createUserAccount(session, "carol", "mypass");
+    const key = await bayes.loginUser("carol", "mypass");
     assert(key !== null);
     assert(Array.isArray(bayes.getBuckets(key!)));
   } finally { cleanup(); }
@@ -1021,7 +1021,7 @@ Deno.test("Bayes: new user can log in with correct password", async () => {
 Deno.test("Bayes: deleteUserAccount removes the user", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "dave", "pass");
+    await bayes.createUserAccount(session, "dave", "pass");
     bayes.deleteUserAccount(session, "dave");
     const users = bayes.listUsers(session);
     assert(!users.some((u) => u.name === "dave"));
@@ -1041,8 +1041,8 @@ Deno.test("Bayes: deleteUserAccount cannot delete admin", async () => {
 Deno.test("Bayes: deleteUserAccount requires admin session", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "eve", "pass");
-    const eveKey = bayes.loginUser("eve", "pass")!;
+    await bayes.createUserAccount(session, "eve", "pass");
+    const eveKey = (await bayes.loginUser("eve", "pass"))!;
     assertThrows(
       () => bayes.deleteUserAccount(eveKey, "eve"),
       Error, "Admin access required",
@@ -1053,19 +1053,19 @@ Deno.test("Bayes: deleteUserAccount requires admin session", async () => {
 Deno.test("Bayes: setPassword updates login credentials", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "frank", "oldpass");
-    const key = bayes.loginUser("frank", "oldpass")!;
-    bayes.setPassword(key, "newpass");
-    assertEquals(bayes.loginUser("frank", "oldpass"), null);
-    assert(bayes.loginUser("frank", "newpass") !== null);
+    await bayes.createUserAccount(session, "frank", "oldpass");
+    const key = (await bayes.loginUser("frank", "oldpass"))!;
+    await bayes.setPassword(key, "newpass");
+    assertEquals(await bayes.loginUser("frank", "oldpass"), null);
+    assert((await bayes.loginUser("frank", "newpass")) !== null);
   } finally { cleanup(); }
 });
 
 Deno.test("Bayes: user data is isolated — buckets not visible across users", async () => {
   const { bayes, session, cleanup } = await makeStack();
   try {
-    bayes.createUserAccount(session, "grace", "pass");
-    const graceKey = bayes.loginUser("grace", "pass")!;
+    await bayes.createUserAccount(session, "grace", "pass");
+    const graceKey = (await bayes.loginUser("grace", "pass"))!;
 
     bayes.createBucket(session, "admin-bucket");
     bayes.createBucket(graceKey, "grace-bucket");
