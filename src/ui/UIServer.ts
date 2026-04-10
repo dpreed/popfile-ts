@@ -21,8 +21,8 @@
  *   GET  /history              → recent 100 classifications
  *   POST /history/retrain     → correct a history entry's bucket
  *   GET  /api/buckets          → JSON bucket list
- *   GET  /api/classify?file=   → JSON classify result
- *   POST /api/train            → JSON train endpoint
+ *   GET  /api/stats            → JSON stats for current user
+ *   GET  /metrics              → Prometheus text metrics (unauthenticated)
  */
 
 import { Module, LifecycleResult } from "../core/Module.ts";
@@ -40,6 +40,8 @@ export class UIServer extends Module {
   #loginAttempts: Map<string, { count: number; until: number }> = new Map();
   /** Pre-authentication CSRF tokens for the login form: token → expiry timestamp. */
   #loginCsrfTokens: Map<string, number> = new Map();
+  /** Unix ms when the server started — used for uptime in /metrics. */
+  #startTime = 0;
 
   constructor() {
     super();
@@ -80,6 +82,9 @@ export class UIServer extends Module {
     const hostname = this.config_("local") === "1" ? "127.0.0.1" : "0.0.0.0";
     const useTls = this.config_("tls") === "1";
 
+    this.#startTime = Date.now();
+    this.mqRegister_("TICKD", this);
+
     if (useTls) {
       const certPath = this.configuration_().getUserPath(this.config_("tls_cert"));
       const keyPath  = this.configuration_().getUserPath(this.config_("tls_key"));
@@ -117,6 +122,37 @@ export class UIServer extends Module {
     this.#loginAttempts.clear();
     this.#loginCsrfTokens.clear();
     super.stop();
+  }
+
+  /**
+   * Hourly TICKD: sweep stale browser sessions and expired rate-limiter entries
+   * to prevent unbounded memory growth in long-running deployments.
+   */
+  override deliver(type: string): void {
+    if (type !== "TICKD") return;
+    const bayes = this.getModule_<Bayes>("classifier");
+
+    // Remove browser session entries whose Bayes session has timed out
+    for (const [token, bayesKey] of this.#browserSessions) {
+      if (bayes.getUsername(bayesKey) === null) {
+        this.#browserSessions.delete(token);
+        this.#csrfTokens.delete(bayesKey);
+        this.#needsPasswordChange.delete(bayesKey);
+      }
+    }
+
+    // Remove rate-limiter entries: expired lockouts and partial-failure counts
+    const now = Date.now();
+    for (const [ip, entry] of this.#loginAttempts) {
+      if (entry.until === 0 || now >= entry.until) {
+        this.#loginAttempts.delete(ip);
+      }
+    }
+
+    // Sweep expired pre-auth CSRF tokens (belt-and-suspenders alongside issue-time sweep)
+    for (const [token, expiry] of this.#loginCsrfTokens) {
+      if (now >= expiry) this.#loginCsrfTokens.delete(token);
+    }
   }
 
   /** Path to the directory where uploaded .eml files are cached. */
@@ -230,6 +266,9 @@ export class UIServer extends Module {
     }
 
     try {
+      // Unauthenticated routes
+      if (path === "/metrics" && req.method === "GET") return this.#metricsHandler(bayes);
+
       // Auth routes — no session required
       if (path === "/login" && req.method === "GET") {
         const expired = url.searchParams.get("expired") === "1";
@@ -1107,6 +1146,36 @@ export class UIServer extends Module {
 
   #apiStats(bayes: Bayes, session: string): Response {
     return Response.json(bayes.getStats(session));
+  }
+
+  #metricsHandler(bayes: Bayes): Response {
+    const m = bayes.getGlobalMetrics();
+    const uptimeSeconds = Math.floor((Date.now() - this.#startTime) / 1000);
+
+    const lines: string[] = [
+      "# HELP popfile_classified_total Total messages classified",
+      "# TYPE popfile_classified_total counter",
+      `popfile_classified_total ${m.totalClassified}`,
+      "# HELP popfile_retrained_total Total messages manually retrained",
+      "# TYPE popfile_retrained_total counter",
+      `popfile_retrained_total ${m.totalRetrained}`,
+      "# HELP popfile_magnet_hits_total Total classifications via magnet rules",
+      "# TYPE popfile_magnet_hits_total counter",
+      `popfile_magnet_hits_total ${m.magnetHits}`,
+      "# HELP popfile_words_trained_total Words trained per bucket",
+      "# TYPE popfile_words_trained_total gauge",
+      ...m.buckets.map(b => `popfile_words_trained_total{bucket="${b.name}"} ${b.wordCount}`),
+      "# HELP popfile_classified_by_bucket_total Messages classified per bucket",
+      "# TYPE popfile_classified_by_bucket_total counter",
+      ...m.buckets.map(b => `popfile_classified_by_bucket_total{bucket="${b.name}"} ${b.classifiedCount}`),
+      "# HELP popfile_uptime_seconds Seconds since the server started",
+      "# TYPE popfile_uptime_seconds gauge",
+      `popfile_uptime_seconds ${uptimeSeconds}`,
+    ];
+
+    return new Response(lines.join("\n") + "\n", {
+      headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" },
+    });
   }
 
   #pageStats(bayes: Bayes, session: string): Response {

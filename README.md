@@ -167,6 +167,21 @@ Passwords are hashed with PBKDF2-SHA256 (100 000 iterations). Existing plaintext
 - Security headers on all responses: `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`
 - `Secure` cookie flag enabled automatically when HTTPS is on
 
+## Monitoring
+
+`GET /metrics` returns a Prometheus-compatible text exposition (no authentication required):
+
+```
+popfile_classified_total 1234
+popfile_retrained_total 56
+popfile_magnet_hits_total 78
+popfile_words_trained_total{bucket="spam"} 12345
+popfile_classified_by_bucket_total{bucket="spam"} 123
+popfile_uptime_seconds 3600
+```
+
+Metrics aggregate across all users. Add a scrape target pointing at the same host and port as the web UI.
+
 ## Magnets
 
 Magnets are explicit rules that bypass Bayes and assign a message directly to a bucket. Useful for mailing lists, known senders, etc. Configure them under **Magnets**. Supported fields: `from`, `to`, `subject`, `cc`.
@@ -174,7 +189,7 @@ Magnets are explicit rules that bypass Bayes and assign a message directly to a 
 ## Development
 
 ```bash
-deno task test      # run all 196 tests
+deno task test      # run all 201 tests
 deno task start     # start the server
 ```
 

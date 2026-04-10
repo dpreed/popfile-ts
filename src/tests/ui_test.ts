@@ -741,6 +741,31 @@ Deno.test("UIServer: GET /wordscores?file= is ignored (no result)", async () => 
 });
 
 // ---------------------------------------------------------------------------
+// Prometheus /metrics endpoint
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: GET /metrics returns Prometheus text without auth", async () => {
+  const { baseUrl, bayes, session, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.createBucket(session, "spam");
+    // No history seeding needed — just verify the metric keys are present
+    // No cookie — unauthenticated request
+    const res = await fetch(`${baseUrl}/metrics`);
+    assertEquals(res.status, 200);
+    const ct = res.headers.get("content-type") ?? "";
+    assert(ct.includes("text/plain"), `Expected text/plain, got: ${ct}`);
+    const body = await res.text();
+    assert(body.includes("popfile_classified_total"), "Expected classified counter");
+    assert(body.includes("popfile_retrained_total"), "Expected retrained counter");
+    assert(body.includes("popfile_magnet_hits_total"), "Expected magnet hits counter");
+    assert(body.includes('popfile_words_trained_total{bucket="inbox"}'), "Expected inbox gauge");
+    assert(body.includes('popfile_words_trained_total{bucket="spam"}'), "Expected spam gauge");
+    assert(body.includes("popfile_uptime_seconds"), "Expected uptime gauge");
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
 // Users management (admin)
 // ---------------------------------------------------------------------------
 
@@ -954,6 +979,103 @@ Deno.test("UIServer: successful login clears failed-attempt counter", async () =
       assertEquals(r.status, 200);
       const b = await r.text();
       assert(!b.includes("Too many"), "Should not be rate-limited after counter reset");
+    }
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// History export
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: GET /history/export returns CSV with headers", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    // Classify a message to populate history
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+
+    const res = await get(baseUrl, "/history/export", cookie);
+    assertEquals(res.status, 200);
+    const ct = res.headers.get("content-type") ?? "";
+    assert(ct.includes("text/csv"), `Expected text/csv, got: ${ct}`);
+    const cd = res.headers.get("content-disposition") ?? "";
+    assert(cd.includes("attachment"), "Expected attachment disposition");
+    assert(cd.includes(".csv"), "Expected .csv filename");
+    const body = await res.text();
+    // First line must be the header row
+    const firstLine = body.split("\r\n")[0];
+    assert(firstLine.includes("id"), "Expected id column");
+    assert(firstLine.includes("subject"), "Expected subject column");
+    assert(firstLine.includes("bucket"), "Expected bucket column");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /history/export?bucket= filters by bucket", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.createBucket(session, "spam");
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+
+    // Filter for a bucket that has no messages
+    const res = await get(baseUrl, "/history/export?bucket=spam", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    const lines = body.split("\r\n").filter((l) => l.length > 0);
+    // Only the header row — no data rows for empty bucket
+    assertEquals(lines.length, 1, "Expected only header row for empty bucket filter");
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// TICKD sweep (deliver)
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: TICKD sweep removes stale browser sessions", async () => {
+  const { ui, bayes, session, baseUrl, cookie, cleanup } = await makeUIStack();
+  try {
+    // Expire all Bayes sessions (including the one backing the browser cookie)
+    // without making another browser request. The browser cookie still exists
+    // but its Bayes session is now gone.
+    bayes.releaseAllSessions();
+
+    // Trigger the hourly sweep
+    ui.deliver("TICKD");
+
+    // The browser session entry is gone — request should redirect to /login
+    const res = await fetch(`${baseUrl}/stats`, {
+      redirect: "manual",
+      headers: { "Cookie": cookie },
+    });
+    await res.body?.cancel();
+    assert(
+      res.status === 302 || res.status === 303,
+      `Expected redirect after session sweep, got ${res.status}`,
+    );
+    const location = res.headers.get("location") ?? "";
+    assert(location.includes("/login"), `Expected redirect to /login, got: ${location}`);
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: TICKD sweep resets partial rate-limiter counts", async () => {
+  const { ui, baseUrl, cleanup } = await makeUIStack();
+  try {
+    // Accumulate 5 failed logins (below the lockout threshold of 10)
+    for (let i = 0; i < 5; i++) {
+      const r = await loginAttempt(baseUrl, "wrong");
+      await r.body?.cancel();
+    }
+    // Sweep clears the partial count
+    ui.deliver("TICKD");
+    // 5 more failures should NOT trigger lockout (counter was reset to 0)
+    for (let i = 0; i < 5; i++) {
+      const r = await loginAttempt(baseUrl, "wrong");
+      const body = await r.text();
+      assert(!body.includes("Too many"), `Unexpected rate-limit at attempt ${i + 1} after sweep`);
     }
   } finally { await cleanup(); }
 });

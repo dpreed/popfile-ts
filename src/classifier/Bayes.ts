@@ -780,6 +780,49 @@ export class Bayes extends Module {
     return { totalClassified, totalRetrained, magnetHits, totalWords, buckets };
   }
 
+  /**
+   * Aggregate metrics across all users — no session required.
+   * Used by the /metrics Prometheus endpoint.
+   */
+  getGlobalMetrics(): {
+    totalClassified: number;
+    totalRetrained: number;
+    magnetHits: number;
+    buckets: { name: string; wordCount: number; classifiedCount: number }[];
+  } {
+    const db = this.db_();
+
+    const totalClassified = db.prepare(
+      "SELECT COUNT(*) FROM history"
+    ).value<[number]>()?.[0] ?? 0;
+
+    const totalRetrained = db.prepare(
+      "SELECT COUNT(*) FROM history WHERE usedtobe IS NOT NULL"
+    ).value<[number]>()?.[0] ?? 0;
+
+    const magnetHits = db.prepare(
+      "SELECT COUNT(*) FROM history WHERE magnetid IS NOT NULL"
+    ).value<[number]>()?.[0] ?? 0;
+
+    const rows = db.prepare(`
+      SELECT b.name,
+             COALESCE(SUM(m.times), 0) AS words,
+             COUNT(DISTINCT h.id)       AS classified
+      FROM   buckets b
+      LEFT   JOIN matrix m  ON m.bucketid = b.id
+      LEFT   JOIN history h ON h.bucketid = b.id
+      WHERE  b.pseudo = 0
+      GROUP  BY b.name
+      ORDER  BY b.name
+    `).values<[string, number, number]>();
+
+    const buckets = rows.map(([name, wordCount, classifiedCount]) => ({
+      name, wordCount, classifiedCount,
+    }));
+
+    return { totalClassified, totalRetrained, magnetHits, buckets };
+  }
+
   // -------------------------------------------------------------------------
   // Magnet management
   // -------------------------------------------------------------------------
