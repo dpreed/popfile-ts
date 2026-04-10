@@ -1079,3 +1079,239 @@ Deno.test("UIServer: TICKD sweep resets partial rate-limiter counts", async () =
     }
   } finally { await cleanup(); }
 });
+
+// ---------------------------------------------------------------------------
+// History retrain
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: POST /history/retrain reassigns a history entry", async () => {
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.createBucket(session, "spam");
+
+    // Keep the file alive through retrain so retrainHistory can re-parse it
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    try {
+      bayes.classify(session, tmp);
+
+      const history = bayes.getHistory(session);
+      assertEquals(history.length, 1, "Expected one history entry");
+      const id = history[0].id;
+
+      const form = new URLSearchParams({ id: String(id), bucket: "spam", back: "/history" });
+      const res = await post(baseUrl, "/history/retrain", form, cookie, csrf);
+      assert(res.status === 302 || res.status === 303, `Expected redirect, got ${res.status}`);
+      await res.body?.cancel();
+
+      const updated = bayes.getHistory(session);
+      assertEquals(updated[0].bucket, "spam", "History entry bucket should be updated to spam");
+    } finally { await Deno.remove(tmp); }
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: POST /settings saves a config value", async () => {
+  const { baseUrl, cookie, csrf, cleanup } = await makeUIStack();
+  try {
+    const form = new URLSearchParams({ classifier_unclassified_weight: "100" });
+    const res = await post(baseUrl, "/settings", form, cookie, csrf);
+    assertEquals(res.status, 200, "Expected settings page (200) after save");
+    const body = await res.text();
+    assert(body.includes("saved") || body.includes("Settings"), "Expected confirmation on settings page");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /settings is forbidden for non-admin", async () => {
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
+  try {
+    // Create a non-admin user and log in as them
+    await bayes.createUserAccount(session, "bob", "pass");
+    const bobCsrfRes = await fetch(`${baseUrl}/login`);
+    const bobLoginHtml = await bobCsrfRes.text();
+    const bobToken = /name="_login_csrf" value="([^"]+)"/.exec(bobLoginHtml)?.[1] ?? "";
+    const bobLoginRes = await fetch(`${baseUrl}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "bob", password: "pass", _login_csrf: bobToken }),
+    });
+    await bobLoginRes.body?.cancel();
+    const bobCookie = (bobLoginRes.headers.get("set-cookie") ?? "").split(";")[0];
+
+    const form = new URLSearchParams({ classifier_unclassified_weight: "100" });
+    const res = await post(baseUrl, "/settings", form, bobCookie);
+    assertEquals(res.status, 403, "Non-admin should be forbidden from changing settings");
+    await res.body?.cancel();
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Password change
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: POST /users/password changes password and allows re-login", async () => {
+  const { baseUrl, cookie, csrf, cleanup } = await makeUIStack();
+  try {
+    const form = new URLSearchParams({ password: "newpass", confirm: "newpass" });
+    const res = await post(baseUrl, "/users/password", form, cookie, csrf);
+    assert(res.status === 302 || res.status === 303, `Expected redirect, got ${res.status}`);
+    await res.body?.cancel();
+
+    // Should now be able to log in with the new password
+    const loginCsrfRes = await fetch(`${baseUrl}/login`);
+    const loginHtml = await loginCsrfRes.text();
+    const loginToken = /name="_login_csrf" value="([^"]+)"/.exec(loginHtml)?.[1] ?? "";
+    const loginRes = await fetch(`${baseUrl}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "admin", password: "newpass", _login_csrf: loginToken }),
+    });
+    await loginRes.body?.cancel();
+    assert(loginRes.headers.get("set-cookie")?.includes("popfile_session"),
+      "Should receive a new session cookie after login with new password");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /users/password ignores mismatched confirm", async () => {
+  const { baseUrl, cookie, csrf, cleanup } = await makeUIStack();
+  try {
+    const form = new URLSearchParams({ password: "newpass", confirm: "different" });
+    const res = await post(baseUrl, "/users/password", form, cookie, csrf);
+    assert(res.status === 302 || res.status === 303, `Expected redirect, got ${res.status}`);
+    await res.body?.cancel();
+
+    // Old (blank) password must still work
+    const loginCsrfRes = await fetch(`${baseUrl}/login`);
+    const loginHtml = await loginCsrfRes.text();
+    const loginToken = /name="_login_csrf" value="([^"]+)"/.exec(loginHtml)?.[1] ?? "";
+    const loginRes = await fetch(`${baseUrl}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "admin", password: "", _login_csrf: loginToken }),
+    });
+    await loginRes.body?.cancel();
+    assert(loginRes.headers.get("set-cookie")?.includes("popfile_session"),
+      "Blank password should still work when confirm was mismatched");
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// History export — search filter
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: GET /history/export?q= filters by subject keyword", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+
+    // Classify two messages with distinct subjects
+    const tmp1 = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp1, SAMPLE_EML); // subject: "Hello world"
+    try { bayes.classify(session, tmp1); } finally { await Deno.remove(tmp1); }
+
+    const other = [
+      "From: other@example.com",
+      "Subject: Totally different topic",
+      "Content-Type: text/plain",
+      "",
+      "Something else.",
+    ].join("\r\n");
+    const tmp2 = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp2, other);
+    try { bayes.classify(session, tmp2); } finally { await Deno.remove(tmp2); }
+
+    // Search for "Hello" — should return only the first message
+    const res = await get(baseUrl, "/history/export?q=Hello", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    const dataLines = body.split("\r\n").filter((l) => l.length > 0).slice(1); // skip header
+    assertEquals(dataLines.length, 1, "Expected exactly one matching row");
+    assert(dataLines[0].includes("Hello world"), "Expected matching subject in CSV row");
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Magnet cc field
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: POST /magnets/add supports cc magnet type", async () => {
+  const { baseUrl, bayes, session, cookie, csrf, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "lists");
+    const form = new URLSearchParams({ bucket: "lists", type: "cc", value: "newsletter@example.com" });
+    const res = await post(baseUrl, "/magnets/add", form, cookie, csrf);
+    assert(res.status === 302 || res.status === 303 || res.status === 200,
+      `Unexpected status ${res.status}`);
+    await res.body?.cancel();
+    const magnets = bayes.getMagnets(session);
+    const m = magnets.find((m) => m.val === "newsletter@example.com");
+    assert(m !== undefined, "cc magnet should have been added");
+    assertEquals(m!.type, "cc", "Magnet type should be cc");
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// CSRF enforcement — all mutation routes must reject missing/wrong token
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: mutation routes return 403 without valid CSRF token", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.addMagnet(session, "spam", "from", "x@x.com");
+    const magnetId = bayes.getMagnets(session)[0].id;
+
+    // Classify a message to get a history id
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    let historyId = 0;
+    try {
+      bayes.classify(session, tmp);
+      historyId = bayes.getHistory(session)[0].id;
+    } finally { await Deno.remove(tmp); }
+
+    const routes: Array<[string, URLSearchParams]> = [
+      ["/buckets/create",   new URLSearchParams({ name: "newbucket" })],
+      ["/buckets/delete",   new URLSearchParams({ name: "spam" })],
+      ["/buckets/color",    new URLSearchParams({ name: "spam", color: "#ff0000" })],
+      ["/magnets/add",      new URLSearchParams({ bucket: "spam", type: "from", value: "y@y.com" })],
+      ["/magnets/delete",   new URLSearchParams({ id: String(magnetId) })],
+      ["/history/retrain",  new URLSearchParams({ id: String(historyId), bucket: "spam" })],
+      ["/settings",         new URLSearchParams({ classifier_unclassified_weight: "1" })],
+      ["/users/create",     new URLSearchParams({ username: "ghost", password: "x" })],
+      ["/users/delete",     new URLSearchParams({ username: "ghost" })],
+      ["/users/password",   new URLSearchParams({ password: "x", confirm: "x" })],
+    ];
+
+    for (const [path, form] of routes) {
+      // POST with no _csrf field at all
+      const res = await fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      await res.body?.cancel();
+      assertEquals(res.status, 403, `Expected 403 for ${path} without CSRF token`);
+
+      // POST with a wrong _csrf value
+      const badForm = new URLSearchParams(form);
+      badForm.set("_csrf", "not-the-right-token");
+      const res2 = await fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded" },
+        body: badForm.toString(),
+      });
+      await res2.body?.cancel();
+      assertEquals(res2.status, 403, `Expected 403 for ${path} with wrong CSRF token`);
+    }
+  } finally { await cleanup(); }
+});

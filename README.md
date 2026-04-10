@@ -189,7 +189,7 @@ Magnets are explicit rules that bypass Bayes and assign a message directly to a 
 ## Development
 
 ```bash
-deno task test      # run all 201 tests
+deno task test      # run all 209 tests
 deno task start     # start the server
 ```
 
