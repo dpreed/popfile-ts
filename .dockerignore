@@ -1,0 +1,15 @@
+.git/
+.claude/
+.github/
+node_modules/
+
+# Runtime data — belongs on the mounted volume, not in the image
+popfile.db
+popfile.db-shm
+popfile.db-wal
+popfile.cfg
+logs/
+training/
+
+# Deno local cache (image builds its own in /deno-dir)
+deno.lock.bak
