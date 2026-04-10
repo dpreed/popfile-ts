@@ -191,8 +191,6 @@ export class UIServer extends Module {
 
       // API routes (JSON)
       if (path === "/api/buckets") return this.#apiBuckets(bayes, session);
-      if (path === "/api/classify") return await this.#apiClassify(url, bayes, session);
-      if (path === "/api/train" && req.method === "POST") return await this.#apiTrain(req, bayes, session);
 
       // HTML routes
       if (path === "/api/stats") return this.#apiStats(bayes, session);
@@ -464,34 +462,6 @@ export class UIServer extends Module {
     return Response.json(data);
   }
 
-  async #apiTrain(req: Request, bayes: Bayes, session: string): Promise<Response> {
-    const { file, bucket } = await req.json();
-    if (!file || !bucket) return Response.json({ error: "Missing file or bucket" }, { status: 400 });
-    try {
-      const { MailParser } = await import("../classifier/MailParser.ts");
-      const parsed = new MailParser().parseFile(file);
-      bayes.trainMessage(session, bucket, parsed);
-      return Response.json({ ok: true, file, bucket });
-    } catch (e) {
-      return Response.json({ error: String(e) }, { status: 400 });
-    }
-  }
-
-  async #apiClassify(url: URL, bayes: Bayes, session: string): Promise<Response> {
-    const file = url.searchParams.get("file");
-    if (!file) return Response.json({ error: "Missing ?file=" }, { status: 400 });
-    try {
-      const result = bayes.classify(session, file);
-      return Response.json({
-        bucket: result.bucket,
-        magnetUsed: result.magnetUsed,
-        scores: Object.fromEntries(result.scores),
-      });
-    } catch (e) {
-      return Response.json({ error: String(e) }, { status: 400 });
-    }
-  }
-
   // -------------------------------------------------------------------------
   // HTML page handlers
   // -------------------------------------------------------------------------
@@ -666,16 +636,14 @@ export class UIServer extends Module {
         .map((b) => `<option value="${esc(b)}"${b === result.bucket ? " selected" : ""}>${esc(b)}</option>`)
         .join("");
       const resultColor = colors.get(result.bucket) ?? "black";
-      // Word scores link: use cache ID for uploads so the link survives server restarts
-      const wsParam = cacheId
-        ? `id=${encodeURIComponent(cacheId)}`
-        : `file=${encodeURIComponent(filePath)}`;
-      const wordScoresLink = `<a href="/wordscores?${wsParam}" style="font-size:.85rem">Show word scores →</a>`;
-      const trainForm = buckets.length > 0 ? `
+      const wordScoresLink = cacheId
+        ? `<a href="/wordscores?id=${encodeURIComponent(cacheId)}" style="font-size:.85rem">Show word scores →</a>`
+        : "";
+      const trainForm = cacheId && buckets.length > 0 ? `
         <div class="train-correction">
           <p>Was this wrong? Train as:</p>
           <form method="POST" action="/train" class="inline-form">
-            <input type="hidden" name="file" value="${esc(filePath)}">
+            <input type="hidden" name="id" value="${esc(cacheId)}">
             <select name="bucket">${bucketOptions}</select>
             <button class="btn-primary">Train</button>
           </form>
@@ -809,20 +777,21 @@ export class UIServer extends Module {
       }
     }
 
-    // Legacy server-path path (used by /classify "train correction" form)
-    const file = (form.get("file") as string | null)?.trim();
-    if (!file) return await this.#pageTrain(bayes, session);
+    // Cache-ID path (used by /classify "train correction" form)
+    const id = (form.get("id") as string | null)?.trim();
+    const cachedPath = id ? this.#resolveCacheId(id) : null;
+    if (!cachedPath) return await this.#pageTrain(bayes, session);
     try {
       const { MailParser } = await import("../classifier/MailParser.ts");
-      const parsed = new MailParser().parseFile(file);
+      const parsed = new MailParser().parseFile(cachedPath);
       bayes.trainMessage(session, bucket, parsed);
       return await this.#pageTrain(bayes, session, {
-        message: `Trained "${file}" as "${bucket}".`,
+        message: `Trained message as "${bucket}".`,
         prefillBucket: bucket,
       });
     } catch (e) {
       return await this.#pageTrain(bayes, session, {
-        error: `Error training "${file}": ${String(e)}`,
+        error: `Error training: ${String(e)}`,
         prefillBucket: bucket,
       });
     }
@@ -1124,11 +1093,9 @@ export class UIServer extends Module {
     const buckets = bayes.getBuckets(session);
     const colors  = bayes.getBucketColors(session);
 
-    // Resolve file: ?id=<uuid> (cached upload) or ?file=<path> (server path)
+    // Resolve file: ?id=<uuid> only — direct server paths are not accepted
     const cacheId = url.searchParams.get("id")?.trim() ?? "";
-    const filePath = cacheId
-      ? this.#resolveCacheId(cacheId)
-      : (url.searchParams.get("file")?.trim() || null);
+    const filePath = cacheId ? this.#resolveCacheId(cacheId) : null;
 
     let resultHtml = "";
     if (cacheId && !filePath) {

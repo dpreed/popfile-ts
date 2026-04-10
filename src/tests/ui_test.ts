@@ -559,6 +559,7 @@ Deno.test("UIServer: POST /classify word scores link uses ?id= not ?file=", asyn
     const body = await res.text();
     assert(body.includes("/wordscores?id="), "Expected word scores link with ?id=");
     assert(!body.includes("/wordscores?file="), "Should not use ?file= for uploads");
+    assert(!body.includes('name="file"'), "Train correction form must not expose server paths");
   } finally { await cleanup(); }
 });
 
@@ -679,15 +680,34 @@ Deno.test("UIServer: POST /magnets/delete removes a magnet and redirects", async
 });
 
 // ---------------------------------------------------------------------------
-// API train
+// Removed file-path API endpoints return 404
 // ---------------------------------------------------------------------------
 
-Deno.test("UIServer: POST /api/train returns 400 for missing fields", async () => {
+Deno.test("UIServer: GET /api/classify is removed (404)", async () => {
+  const { baseUrl, cookie, cleanup } = await makeUIStack();
+  try {
+    const res = await get(baseUrl, "/api/classify?file=/etc/passwd", cookie);
+    assertEquals(res.status, 404);
+    await res.body?.cancel();
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /api/train is removed (404)", async () => {
   const { baseUrl, cookie, cleanup } = await makeUIStack();
   try {
     const res = await post(baseUrl, "/api/train", JSON.stringify({}), cookie);
-    assertEquals(res.status, 400);
+    assertEquals(res.status, 404);
     await res.body?.cancel();
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /wordscores?file= is ignored (no result)", async () => {
+  const { baseUrl, cookie, cleanup } = await makeUIStack();
+  try {
+    const res = await get(baseUrl, "/wordscores?file=/etc/passwd", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(!body.includes("Classification:"), "Should not classify server-side paths");
   } finally { await cleanup(); }
 });
 
