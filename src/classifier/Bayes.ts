@@ -240,6 +240,11 @@ export class Bayes extends Module {
     this.#sessions.delete(key);
   }
 
+  /** Release all active sessions (used in tests to simulate server-side timeout). */
+  releaseAllSessions(): void {
+    this.#sessions.clear();
+  }
+
   /** Returns true if the user's current stored password is a hash of the empty string. */
   async isDefaultPassword(sessionKey: string): Promise<boolean> {
     const userId = this.#validSession(sessionKey);

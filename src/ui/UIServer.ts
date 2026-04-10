@@ -36,6 +36,8 @@ export class UIServer extends Module {
   #csrfTokens: Map<string, string> = new Map();
   /** Bayes session keys whose user still has the default (blank) password. */
   #needsPasswordChange: Set<string> = new Set();
+  /** Failed login attempt counts per remote IP. */
+  #loginAttempts: Map<string, { count: number; until: number }> = new Map();
 
   constructor() {
     super();
@@ -73,7 +75,7 @@ export class UIServer extends Module {
 
     this.#server = Deno.serve(
       { port, hostname, onListen: () => this.log_(0, `UI on http://${hostname}:${port}`) },
-      (req) => this.#handle(req),
+      (req, info) => this.#handle(req, (info.remoteAddr as Deno.NetAddr).hostname),
     );
     return LifecycleResult.Ok;
   }
@@ -88,6 +90,7 @@ export class UIServer extends Module {
     this.#browserSessions.clear();
     this.#csrfTokens.clear();
     this.#needsPasswordChange.clear();
+    this.#loginAttempts.clear();
     super.stop();
   }
 
@@ -158,20 +161,28 @@ export class UIServer extends Module {
   // Request routing
   // -------------------------------------------------------------------------
 
-  async #handle(req: Request): Promise<Response> {
+  async #handle(req: Request, remoteIp = "unknown"): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
     const bayes = this.getModule_<Bayes>("classifier");
 
     try {
       // Auth routes — no session required
-      if (path === "/login" && req.method === "GET")  return this.#pageLogin();
-      if (path === "/login" && req.method === "POST") return await this.#doLogin(req, bayes);
+      if (path === "/login" && req.method === "GET") {
+        const expired = url.searchParams.get("expired") === "1";
+        return this.#pageLogin(expired ? "Your session has expired. Please sign in again." : undefined);
+      }
+      if (path === "/login" && req.method === "POST") return await this.#doLogin(req, bayes, remoteIp);
       if (path === "/logout" && req.method === "POST") return this.#doLogout(req, bayes);
 
       // All other routes require authentication
       const session = this.#getSessionFromCookie(req);
       if (!session) return Response.redirect(new URL("/login", req.url), 303);
+
+      // Verify the Bayes session is still alive (may have timed out server-side)
+      if (bayes.getUsername(session) === null) {
+        return this.#expireSession(req, session);
+      }
 
       const isAdmin = bayes.isAdmin(session);
 
@@ -268,13 +279,21 @@ export class UIServer extends Module {
     );
   }
 
-  async #doLogin(req: Request, bayes: Bayes): Promise<Response> {
+  async #doLogin(req: Request, bayes: Bayes, remoteIp: string): Promise<Response> {
+    if (this.#isRateLimited(remoteIp)) {
+      return this.#pageLogin("Too many failed login attempts. Please try again later.");
+    }
+
     const form = await req.formData();
     const username = (form.get("username") as string | null)?.trim() ?? "";
     const password = (form.get("password") as string | null) ?? "";
 
     const bayesKey = await bayes.loginUser(username, password);
-    if (!bayesKey) return this.#pageLogin("Invalid username or password");
+    if (!bayesKey) {
+      this.#recordLoginFailure(remoteIp);
+      return this.#pageLogin("Invalid username or password");
+    }
+    this.#loginAttempts.delete(remoteIp);
 
     const token = this.#generateToken();
     this.#browserSessions.set(token, bayesKey);
@@ -309,6 +328,44 @@ export class UIServer extends Module {
         "Set-Cookie": "popfile_session=; HttpOnly; Path=/; Max-Age=0",
       },
     });
+  }
+
+  /** Called when a browser session cookie points to an expired Bayes session. */
+  #expireSession(req: Request, session: string): Response {
+    for (const [token, key] of this.#browserSessions) {
+      if (key === session) this.#browserSessions.delete(token);
+    }
+    this.#csrfTokens.delete(session);
+    this.#needsPasswordChange.delete(session);
+    return new Response(null, {
+      status: 303,
+      headers: {
+        "Location": new URL("/login?expired=1", req.url).toString(),
+        "Set-Cookie": "popfile_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax",
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Login rate limiting
+  // -------------------------------------------------------------------------
+
+  #isRateLimited(ip: string): boolean {
+    const entry = this.#loginAttempts.get(ip);
+    if (!entry) return false;
+    if (entry.until === 0) return false;      // threshold not yet reached
+    if (Date.now() < entry.until) return true; // within lockout window
+    this.#loginAttempts.delete(ip);            // lockout expired
+    return false;
+  }
+
+  #recordLoginFailure(ip: string): void {
+    const WINDOW = 15 * 60 * 1000; // 15 minutes
+    const MAX = 10;
+    const entry = this.#loginAttempts.get(ip) ?? { count: 0, until: 0 };
+    entry.count++;
+    if (entry.count >= MAX) entry.until = Date.now() + WINDOW;
+    this.#loginAttempts.set(ip, entry);
   }
 
   // -------------------------------------------------------------------------

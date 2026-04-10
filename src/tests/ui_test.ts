@@ -814,3 +814,112 @@ Deno.test("UIServer: GET /train shows bulk import section when training/ dir exi
     assert(body.includes("inbox"), "Expected inbox bucket listed");
   } finally { await cleanup(); }
 });
+
+// ---------------------------------------------------------------------------
+// Session expiry
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: expired Bayes session redirects to /login?expired=1", async () => {
+  const { baseUrl, bayes, cookie, cleanup } = await makeUIStack();
+  try {
+    // Find the Bayes session key for the browser session by exploiting the
+    // fact that the cookie token maps to a bayes key — we force it invalid by
+    // releasing every session except the admin one set up in makeUIStack.
+    // The simplest way: fetch the stats page to confirm we're logged in, then
+    // reach into bayes and release all sessions, then try again.
+    const before = await get(baseUrl, "/stats", cookie);
+    assertEquals(before.status, 200);
+    await before.body?.cancel();
+
+    // Release all Bayes sessions (simulates server-side timeout)
+    bayes.releaseAllSessions();
+
+    const res = await get(baseUrl, "/buckets", cookie);
+    // Should redirect to /login?expired=1 and clear the cookie
+    assert(res.status === 302 || res.status === 303, `Expected redirect, got ${res.status}`);
+    const location = res.headers.get("location") ?? "";
+    assert(location.includes("expired=1"), `Expected expired=1 in redirect, got: ${location}`);
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    assert(setCookie.includes("Max-Age=0"), "Expected cookie to be cleared");
+    await res.body?.cancel();
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /login?expired=1 shows session-expired message", async () => {
+  const { baseUrl, cleanup } = await makeUIStack();
+  try {
+    const res = await fetch(`${baseUrl}/login?expired=1`, { redirect: "manual" });
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("expired") || body.includes("session"), "Expected expiry message");
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Brute-force protection
+// ---------------------------------------------------------------------------
+
+Deno.test("UIServer: 10 failed logins trigger rate limit", async () => {
+  const { baseUrl, cleanup } = await makeUIStack();
+  try {
+    // Send 10 bad-password attempts (threshold)
+    for (let i = 0; i < 10; i++) {
+      const res = await fetch(`${baseUrl}/login`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ username: "admin", password: "wrong" }),
+      });
+      await res.body?.cancel();
+    }
+    // 11th attempt should hit the rate limit
+    const res = await fetch(`${baseUrl}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "admin", password: "" }),
+    });
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("Too many") || body.includes("rate") || body.includes("later"),
+      `Expected rate-limit message, got: ${body.substring(0, 200)}`);
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: successful login clears failed-attempt counter", async () => {
+  const { baseUrl, cleanup } = await makeUIStack();
+  try {
+    // 9 failures (one below threshold)
+    for (let i = 0; i < 9; i++) {
+      const r = await fetch(`${baseUrl}/login`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ username: "admin", password: "bad" }),
+      });
+      await r.body?.cancel();
+    }
+    // Successful login — clears the counter
+    const ok = await fetch(`${baseUrl}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "admin", password: "" }),
+    });
+    assert(ok.status === 302 || ok.status === 303, `Expected redirect on success, got ${ok.status}`);
+    await ok.body?.cancel();
+
+    // Another 9 failures should still be allowed (counter was reset)
+    for (let i = 0; i < 9; i++) {
+      const r = await fetch(`${baseUrl}/login`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ username: "admin", password: "bad" }),
+      });
+      assertEquals(r.status, 200);
+      const b = await r.text();
+      assert(!b.includes("Too many"), "Should not be rate-limited after counter reset");
+    }
+  } finally { await cleanup(); }
+});
