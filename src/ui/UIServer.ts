@@ -15,8 +15,9 @@
  *   POST /magnets/delete       → delete a magnet
  *   GET  /classify             → classify form
  *   POST /classify             → classify a message file
- *   GET  /train                → train form
- *   POST /train                → train a message file into a bucket
+ *   GET  /train                → train form (file upload + bulk import)
+ *   POST /train                → train an uploaded .eml into a bucket
+ *   POST /train/import         → bulk-train from training/ directory
  *   GET  /history              → recent 100 classifications
  *   POST /history/retrain     → correct a history entry's bucket
  *   GET  /api/buckets          → JSON bucket list
@@ -31,6 +32,8 @@ export class UIServer extends Module {
   #server: Deno.HttpServer | null = null;
   /** Maps random UI cookie token → Bayes session key. */
   #browserSessions: Map<string, string> = new Map();
+  /** Temp .eml files written for uploaded classify requests; deleted on stop(). */
+  #tmpFiles: Set<string> = new Set();
 
   constructor() {
     super();
@@ -65,6 +68,11 @@ export class UIServer extends Module {
       try { bayes.releaseSessionKey(bayesSession); } catch { /* ok */ }
     }
     this.#browserSessions.clear();
+    // Delete any temp files created for uploaded classify requests
+    for (const p of this.#tmpFiles) {
+      try { Deno.removeSync(p); } catch { /* ok */ }
+    }
+    this.#tmpFiles.clear();
     super.stop();
   }
 
@@ -135,9 +143,11 @@ export class UIServer extends Module {
       if (path === "/magnets/delete" && req.method === "POST") return await this.#deleteMagnet(req, bayes, session);
       if (path === "/classify" && req.method === "GET") return this.#pageClassify(bayes, session);
       if (path === "/classify" && req.method === "POST") return await this.#doClassify(req, bayes, session);
-      if (path === "/train" && req.method === "GET") return this.#pageTrain(bayes, session);
+      if (path === "/train" && req.method === "GET") return await this.#pageTrain(bayes, session);
       if (path === "/train" && req.method === "POST") return await this.#doTrain(req, bayes, session);
-      if (path === "/history" && req.method === "GET") return this.#pageHistory(bayes, session);
+      if (path === "/train/import" && req.method === "POST") return await this.#doTrainImport(req, bayes, session);
+      if (path === "/history" && req.method === "GET") return this.#pageHistory(bayes, session, url);
+      if (path === "/history/export" && req.method === "GET") return this.#exportHistory(bayes, session, url);
       if (path === "/history/retrain" && req.method === "POST") return await this.#doHistoryRetrain(req, bayes, session);
       if (path === "/stats" && req.method === "GET") return this.#pageStats(bayes, session);
       if (path === "/wordscores" && req.method === "GET") return this.#pageWordScores(bayes, url, session);
@@ -479,143 +489,345 @@ export class UIServer extends Module {
     return Response.redirect(new URL("/magnets", req.url), 303);
   }
 
-  #pageClassify(bayes: Bayes, session: string): Response {
+  #pageClassify(bayes: Bayes, session: string, opts?: { result?: string; error?: string }): Response {
     const body = `
       <h2>Classify a message</h2>
-      <form method="POST" action="/classify">
-        <label>
-          Path to .eml file on server:
-          <input type="text" name="file" placeholder="/path/to/message.eml" required style="width:400px">
-        </label>
-        <button class="btn-primary">Classify</button>
-      </form>`;
+      <form method="POST" action="/classify" enctype="multipart/form-data">
+        <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
+          <label>Message file (.eml):
+            <input type="file" name="upload" accept=".eml,message/rfc822" required
+              style="padding:6px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;background:#fff">
+          </label>
+          <button class="btn-primary" style="align-self:flex-start">Classify</button>
+        </div>
+      </form>
+      ${opts?.error ? `<div class="error" style="margin-top:16px">${esc(opts.error)}</div>` : ""}
+      ${opts?.result ?? ""}`;
     return this.#htmlPage("Classify", body, bayes, session);
   }
 
   async #doClassify(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
-    const file = (form.get("file") as string)?.trim();
     const buckets = bayes.getBuckets(session);
-    let resultHtml = "";
-    if (file) {
-      try {
-        const result = bayes.classify(session, file);
-        const colors = bayes.getBucketColors(session);
-        const scoreRows = [...result.scores.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .map(([b, s]) => `<tr><td>${dot(colors.get(b) ?? "black")}${esc(b)}</td><td>${(s * 100).toFixed(4)}%</td></tr>`)
-          .join("");
-        const bucketOptions = buckets
-          .map((b) => `<option value="${esc(b)}"${b === result.bucket ? " selected" : ""}>${esc(b)}</option>`)
-          .join("");
-        const resultColor = colors.get(result.bucket) ?? "black";
-        resultHtml = `
-          <div class="result">
-            <h3>Result: ${dot(resultColor)}<strong>${esc(result.bucket)}</strong>
-              ${result.magnetUsed ? '<span class="badge">magnet</span>' : ""}
-            </h3>
-            <table>
-              <thead><tr><th>Bucket</th><th>Score</th></tr></thead>
-              <tbody>${scoreRows}</tbody>
-            </table>
-            <p style="margin-top:10px">
-              <a href="/wordscores?file=${encodeURIComponent(file)}" style="font-size:.85rem">
-                Show word scores →
-              </a>
-            </p>
-            ${buckets.length > 0 ? `
-            <div class="train-correction">
-              <p>Was this wrong? Train as:</p>
-              <form method="POST" action="/train" class="inline-form">
-                <input type="hidden" name="file" value="${esc(file)}">
-                <select name="bucket">${bucketOptions}</select>
-                <button class="btn-primary">Train</button>
-              </form>
-            </div>` : ""}
-          </div>`;
-      } catch (e) {
-        resultHtml = `<div class="error">Error: ${esc(String(e))}</div>`;
-      }
+
+    // Resolve uploaded file or legacy server-path field
+    let filePath: string | null = null;
+    let isTmp = false;
+    const upload = form.get("upload");
+    if (upload instanceof File) {
+      const bytes = new Uint8Array(await upload.arrayBuffer());
+      filePath = await Deno.makeTempFile({ suffix: ".eml" });
+      await Deno.writeFile(filePath, bytes);
+      this.#tmpFiles.add(filePath);
+      isTmp = true;
+    } else {
+      filePath = (form.get("file") as string | null)?.trim() ?? null;
     }
-    const body = `
-      <h2>Classify a message</h2>
-      <form method="POST" action="/classify">
-        <label>Path to .eml file:<br>
-          <input type="text" name="file" value="${esc(file ?? "")}" style="width:400px" required>
-        </label>
-        <button class="btn-primary">Classify</button>
-      </form>
-      ${resultHtml}`;
-    return this.#htmlPage("Classify", body, bayes, session);
+
+    if (!filePath) return this.#pageClassify(bayes, session);
+
+    try {
+      const result = bayes.classify(session, filePath);
+      const colors = bayes.getBucketColors(session);
+      const scoreRows = [...result.scores.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([b, s]) => `<tr><td>${dot(colors.get(b) ?? "black")}${esc(b)}</td><td>${(s * 100).toFixed(4)}%</td></tr>`)
+        .join("");
+      const bucketOptions = buckets
+        .map((b) => `<option value="${esc(b)}"${b === result.bucket ? " selected" : ""}>${esc(b)}</option>`)
+        .join("");
+      const resultColor = colors.get(result.bucket) ?? "black";
+      const wordScoresLink = `<a href="/wordscores?file=${encodeURIComponent(filePath)}" style="font-size:.85rem">Show word scores →</a>`;
+      const trainForm = buckets.length > 0 ? `
+        <div class="train-correction">
+          <p>Was this wrong? Train as:</p>
+          <form method="POST" action="/train" class="inline-form">
+            <input type="hidden" name="file" value="${esc(filePath)}">
+            <select name="bucket">${bucketOptions}</select>
+            <button class="btn-primary">Train</button>
+          </form>
+        </div>` : "";
+      const resultHtml = `
+        <div class="result">
+          <h3>Result: ${dot(resultColor)}<strong>${esc(result.bucket)}</strong>
+            ${result.magnetUsed ? '<span class="badge">magnet</span>' : ""}
+          </h3>
+          <table>
+            <thead><tr><th>Bucket</th><th>Score</th></tr></thead>
+            <tbody>${scoreRows}</tbody>
+          </table>
+          <p style="margin-top:10px">${wordScoresLink}</p>
+          ${trainForm}
+        </div>`;
+      return this.#pageClassify(bayes, session, { result: resultHtml });
+    } catch (e) {
+      if (isTmp && filePath) {
+        this.#tmpFiles.delete(filePath);
+        await Deno.remove(filePath).catch(() => {});
+      }
+      return this.#pageClassify(bayes, session, { error: `Error: ${String(e)}` });
+    }
   }
 
-  #pageTrain(bayes: Bayes, session: string, message?: string): Response {
+  async #pageTrain(
+    bayes: Bayes,
+    session: string,
+    opts?: { message?: string; error?: string; prefillBucket?: string },
+  ): Promise<Response> {
     const buckets = bayes.getBuckets(session);
-    const bucketOptions = buckets.map((b) => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
+    const bucketOptions = (sel?: string) =>
+      buckets.map((b) => `<option value="${esc(b)}"${b === sel ? " selected" : ""}>${esc(b)}</option>`).join("");
+
+    const notice = opts?.message
+      ? `<div class="success">${esc(opts.message)}</div>`
+      : opts?.error
+      ? `<div class="error">${esc(opts.error)}</div>`
+      : "";
+
+    // ── Bulk import: scan {userDir}/training/ for bucket subdirs ──
+    const userDir = this.configuration_().getUserPath("");
+    const trainingDir = userDir.replace(/\/$/, "") + "/training";
+    const importRows = await this.#scanTrainingDir(trainingDir);
+    let importSection = "";
+    if (importRows.length > 0) {
+      const rows = importRows.map(({ name, count }) => `
+        <tr>
+          <td>${esc(name)}</td>
+          <td>${count.toLocaleString()} .eml file${count === 1 ? "" : "s"}</td>
+          <td>
+            <form method="POST" action="/train/import" style="display:inline">
+              <input type="hidden" name="bucket" value="${esc(name)}">
+              <button class="btn-primary" style="padding:4px 12px;font-size:.85rem"
+                onclick="return confirm('Train ${count} message${count === 1 ? "" : "s"} into &#39;${esc(name)}&#39;?')">
+                Import
+              </button>
+            </form>
+          </td>
+        </tr>`).join("");
+      importSection = `
+        <section style="margin-top:28px">
+          <h3>Bulk import from <code>training/</code> directory</h3>
+          <p>Each subdirectory of <code>${esc(trainingDir)}</code> is treated as a bucket name.</p>
+          <table style="max-width:540px">
+            <thead><tr><th>Bucket</th><th>Messages</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+          <form method="POST" action="/train/import" style="margin-top:10px">
+            <input type="hidden" name="all" value="1">
+            <button class="btn-primary">Import all buckets</button>
+          </form>
+        </section>`;
+    }
+
+    const noBuckets = buckets.length === 0
+      ? `<p style="color:#888;font-style:italic">No buckets yet — <a href="/buckets">create one first</a>.</p>`
+      : "";
+
     const body = `
-      <h2>Train a message</h2>
-      <p>Teach the classifier the correct bucket for a message file.</p>
-      ${message ? `<div class="success">${esc(message)}</div>` : ""}
-      <form method="POST" action="/train">
-        <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
-          <label>Path to .eml file on server:
-            <input type="text" name="file" placeholder="/path/to/message.eml" required style="width:100%">
-          </label>
-          <label>Bucket:
-            <select name="bucket" style="width:100%">${bucketOptions}</select>
-          </label>
-          <button class="btn-primary" style="align-self:flex-start">Train</button>
-        </div>
-      </form>`;
+      <h2>Train</h2>
+      ${notice}
+      ${noBuckets}
+      <section>
+        <h3>Upload a message</h3>
+        <p>Choose an <code>.eml</code> file from your computer and the bucket it belongs to.</p>
+        <form method="POST" action="/train" enctype="multipart/form-data">
+          <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
+            <label>Message file (.eml):
+              <input type="file" name="upload" accept=".eml,message/rfc822" required
+                style="padding:6px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;background:#fff">
+            </label>
+            <label>Bucket:
+              <select name="bucket" style="width:100%">${bucketOptions(opts?.prefillBucket)}</select>
+            </label>
+            <button class="btn-primary" style="align-self:flex-start">Train</button>
+          </div>
+        </form>
+      </section>
+      ${importSection}`;
     return this.#htmlPage("Train", body, bayes, session);
   }
 
   async #doTrain(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
-    const file = (form.get("file") as string)?.trim();
-    const bucket = (form.get("bucket") as string)?.trim();
-    if (!file || !bucket) return this.#pageTrain(bayes, session);
+    const bucket = (form.get("bucket") as string | null)?.trim();
+    if (!bucket) return await this.#pageTrain(bayes, session);
+
+    // File upload path
+    const upload = form.get("upload");
+    if (upload instanceof File) {
+      try {
+        const bytes = new Uint8Array(await upload.arrayBuffer());
+        const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+        try {
+          await Deno.writeFile(tmp, bytes);
+          const { MailParser } = await import("../classifier/MailParser.ts");
+          const parsed = new MailParser().parseFile(tmp);
+          bayes.trainMessage(session, bucket, parsed);
+          const name = upload.name || "message.eml";
+          return await this.#pageTrain(bayes, session, {
+            message: `Trained "${name}" as "${bucket}".`,
+            prefillBucket: bucket,
+          });
+        } finally {
+          await Deno.remove(tmp).catch(() => {});
+        }
+      } catch (e) {
+        return await this.#pageTrain(bayes, session, {
+          error: `Error: ${String(e)}`,
+          prefillBucket: bucket,
+        });
+      }
+    }
+
+    // Legacy server-path path (used by /classify "train correction" form)
+    const file = (form.get("file") as string | null)?.trim();
+    if (!file) return await this.#pageTrain(bayes, session);
     try {
       const { MailParser } = await import("../classifier/MailParser.ts");
       const parsed = new MailParser().parseFile(file);
       bayes.trainMessage(session, bucket, parsed);
-      return this.#pageTrain(bayes, session, `Trained "${file}" as "${bucket}".`);
+      return await this.#pageTrain(bayes, session, {
+        message: `Trained "${file}" as "${bucket}".`,
+        prefillBucket: bucket,
+      });
     } catch (e) {
-      const buckets = bayes.getBuckets(session);
-      const bucketOptions = buckets.map((b) => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
-      const body = `
-        <h2>Train a message</h2>
-        <p>Teach the classifier the correct bucket for a message file.</p>
-        <div class="error">Error: ${esc(String(e))}</div>
-        <form method="POST" action="/train">
-          <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
-            <label>Path to .eml file on server:
-              <input type="text" name="file" value="${esc(file)}" required style="width:100%">
-            </label>
-            <label>Bucket:
-              <select name="bucket" style="width:100%">${bucketOptions}</select>
-            </label>
-            <button class="btn-primary" style="align-self:flex-start">Train</button>
-          </div>
-        </form>`;
-      return this.#htmlPage("Train", body, bayes, session);
+      return await this.#pageTrain(bayes, session, {
+        error: `Error training "${file}": ${String(e)}`,
+        prefillBucket: bucket,
+      });
     }
   }
 
-  #pageHistory(bayes: Bayes, session: string): Response {
-    const history = bayes.getHistory(session, 100);
+  async #doTrainImport(req: Request, bayes: Bayes, session: string): Promise<Response> {
+    const form = await req.formData();
+    const importAll = form.get("all") === "1";
+    const singleBucket = importAll ? null : (form.get("bucket") as string | null)?.trim();
+
+    const userDir = this.configuration_().getUserPath("");
+    const trainingDir = userDir.replace(/\/$/, "") + "/training";
+    const rows = await this.#scanTrainingDir(trainingDir);
+    const targets = importAll ? rows.map((r) => r.name) : (singleBucket ? [singleBucket] : []);
+    if (targets.length === 0) return await this.#pageTrain(bayes, session, { error: "No buckets to import." });
+
+    const { MailParser } = await import("../classifier/MailParser.ts");
+    const parser = new MailParser();
+    const results: string[] = [];
+
+    for (const bucketName of targets) {
+      // Ensure bucket exists
+      const existing = bayes.getBuckets(session);
+      if (!existing.includes(bucketName)) bayes.createBucket(session, bucketName);
+
+      const dir = `${trainingDir}/${bucketName}`;
+      let ok = 0, failed = 0;
+      try {
+        for await (const entry of Deno.readDir(dir)) {
+          if (!entry.isFile || !entry.name.toLowerCase().endsWith(".eml")) continue;
+          try {
+            const parsed = parser.parseFile(`${dir}/${entry.name}`);
+            bayes.trainMessage(session, bucketName, parsed);
+            ok++;
+          } catch {
+            failed++;
+          }
+        }
+      } catch {
+        results.push(`${bucketName}: directory not readable`);
+        continue;
+      }
+      results.push(`${bucketName}: ${ok} trained${failed > 0 ? `, ${failed} failed` : ""}`);
+    }
+
+    return await this.#pageTrain(bayes, session, { message: results.join("; ") });
+  }
+
+  /** Scan trainingDir for subdirectories and count .eml files in each. */
+  async #scanTrainingDir(trainingDir: string): Promise<Array<{ name: string; count: number }>> {
+    const result: Array<{ name: string; count: number }> = [];
+    let entries: Deno.DirEntry[];
+    try {
+      entries = [];
+      for await (const e of Deno.readDir(trainingDir)) entries.push(e);
+    } catch {
+      return [];
+    }
+    for (const entry of entries.filter((e) => e.isDirectory).sort((a, b) => a.name.localeCompare(b.name))) {
+      let count = 0;
+      try {
+        for await (const f of Deno.readDir(`${trainingDir}/${entry.name}`)) {
+          if (f.isFile && f.name.toLowerCase().endsWith(".eml")) count++;
+        }
+      } catch { /* skip unreadable */ }
+      result.push({ name: entry.name, count });
+    }
+    return result;
+  }
+
+  #pageHistory(bayes: Bayes, session: string, url: URL): Response {
+    const PAGE_SIZE = 25;
+    const page    = Math.max(1, parseInt(url.searchParams.get("page") ?? "1", 10));
+    const bucket  = url.searchParams.get("bucket")?.trim() || undefined;
+    const search  = url.searchParams.get("q")?.trim() || undefined;
+    const offset  = (page - 1) * PAGE_SIZE;
+
+    const filterOpts = { bucket, search };
+    const total   = bayes.getHistoryCount(session, filterOpts);
+    const history = bayes.getHistory(session, { limit: PAGE_SIZE, offset, ...filterOpts });
     const buckets = bayes.getBuckets(session);
-    const colors = bayes.getBucketColors(session);
+    const colors  = bayes.getBucketColors(session);
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+    // Build a query-string preserving current filters but overriding page
+    const qs = (p: number) => {
+      const params = new URLSearchParams();
+      if (bucket) params.set("bucket", bucket);
+      if (search) params.set("q", search);
+      if (p > 1) params.set("page", String(p));
+      const s = params.toString();
+      return s ? `?${s}` : "";
+    };
+
     const bucketOptions = (selected: string) => buckets
       .map((b) => `<option value="${esc(b)}"${b === selected ? " selected" : ""}>${esc(b)}</option>`)
       .join("");
 
+    // ── Filter bar ──────────────────────────────────────────────────────────
+    const allBuckets = ["unclassified", ...buckets];
+    const filterBucketOpts = allBuckets
+      .map((b) => `<option value="${esc(b)}"${b === bucket ? " selected" : ""}>${esc(b)}</option>`)
+      .join("");
+    const exportQs = (() => {
+      const p = new URLSearchParams();
+      if (bucket) p.set("bucket", bucket);
+      if (search) p.set("q", search);
+      const s = p.toString();
+      return s ? `?${s}` : "";
+    })();
+    const filterBar = `
+      <form method="GET" action="/history" class="inline-form" style="margin-bottom:16px;flex-wrap:wrap;gap:8px">
+        <select name="bucket" style="font-size:.9rem;padding:6px 8px">
+          <option value="">All buckets</option>
+          ${filterBucketOpts}
+        </select>
+        <input type="text" name="q" value="${esc(search ?? "")}" placeholder="Search subject / from…"
+          style="width:220px">
+        <button class="btn-primary">Filter</button>
+        ${bucket || search ? `<a href="/history" style="font-size:.85rem;color:#888;line-height:2">Clear</a>` : ""}
+        <a href="/history/export${exportQs}"
+          style="margin-left:auto;font-size:.85rem;background:#2c7a4b;color:#fff;padding:6px 14px;border-radius:6px;text-decoration:none">
+          Export CSV
+        </a>
+      </form>`;
+
+    // ── Table rows ───────────────────────────────────────────────────────────
     const rows = history.map((h) => {
       const date = new Date(h.date * 1000).toLocaleString();
       const color = colors.get(h.bucket) ?? "black";
       const corrected = h.usedtobe
         ? `<span title="Corrected from ${esc(h.usedtobe)}" style="color:#888;font-size:.8rem"> (was ${dot(colors.get(h.usedtobe) ?? "black")}${esc(h.usedtobe)})</span>`
         : "";
+      // Retrain form carries back=... so redirect preserves filter state
+      const back = encodeURIComponent(`/history${qs(page)}`);
       return `<tr>
         <td style="white-space:nowrap;font-size:.85rem">${date}</td>
         <td>${esc(h.subject || "(no subject)")}</td>
@@ -624,6 +836,7 @@ export class UIServer extends Module {
         <td>
           <form method="POST" action="/history/retrain" class="inline-form" style="margin:0">
             <input type="hidden" name="id" value="${h.id}">
+            <input type="hidden" name="back" value="${esc(decodeURIComponent(back))}">
             <select name="bucket" style="font-size:.8rem;padding:4px 6px">${bucketOptions(h.bucket)}</select>
             <button class="btn-primary" style="padding:4px 10px;font-size:.8rem">Retrain</button>
           </form>
@@ -631,23 +844,65 @@ export class UIServer extends Module {
       </tr>`;
     }).join("");
 
+    // ── Pagination bar ───────────────────────────────────────────────────────
+    const prevLink = page > 1
+      ? `<a href="/history${qs(page - 1)}" style="padding:5px 12px;background:#fff;border:1px solid #ccc;border-radius:6px;text-decoration:none;font-size:.9rem">← Prev</a>`
+      : `<span style="padding:5px 12px;border:1px solid #eee;border-radius:6px;color:#bbb;font-size:.9rem">← Prev</span>`;
+    const nextLink = page < totalPages
+      ? `<a href="/history${qs(page + 1)}" style="padding:5px 12px;background:#fff;border:1px solid #ccc;border-radius:6px;text-decoration:none;font-size:.9rem">Next →</a>`
+      : `<span style="padding:5px 12px;border:1px solid #eee;border-radius:6px;color:#bbb;font-size:.9rem">Next →</span>`;
+    const pageInfo = `<span style="font-size:.9rem;color:#666">Page ${page} of ${totalPages} &nbsp;·&nbsp; ${total.toLocaleString()} message${total === 1 ? "" : "s"}</span>`;
+    const pagination = totalPages > 1 || total > 0
+      ? `<div style="display:flex;align-items:center;gap:12px;margin-top:16px">${prevLink}${pageInfo}${nextLink}</div>`
+      : "";
+
+    const heading = `History${bucket ? ` — ${esc(bucket)}` : ""}${search ? ` matching "${esc(search)}"` : ""}`;
     const body = `
-      <h2>History <span style="font-weight:400;font-size:.9rem;color:#666">(last ${history.length})</span></h2>
+      <h2>${heading}</h2>
+      ${filterBar}
       ${history.length === 0
-        ? '<p>No classifications yet. Use <a href="/classify">Classify</a> to classify a message.</p>'
+        ? '<p style="color:#888">No matching classifications.</p>'
         : `<table>
             <thead><tr>
               <th>Date</th><th>Subject</th><th>From</th><th>Classification</th><th>Correct to</th>
             </tr></thead>
             <tbody>${rows}</tbody>
-          </table>`}`;
+          </table>`}
+      ${pagination}`;
     return this.#htmlPage("History", body, bayes, session);
+  }
+
+  #exportHistory(bayes: Bayes, session: string, url: URL): Response {
+    const bucket = url.searchParams.get("bucket")?.trim() || undefined;
+    const search = url.searchParams.get("q")?.trim() || undefined;
+    const history = bayes.getHistory(session, { limit: 100_000, offset: 0, bucket, search });
+
+    const csvEscape = (s: string) => `"${s.replace(/"/g, '""')}"`;
+    const lines = [
+      ["id", "date", "from", "subject", "bucket", "was_bucket", "magnet"].join(","),
+      ...history.map((h) => [
+        h.id,
+        new Date(h.date * 1000).toISOString(),
+        csvEscape(h.fromAddress),
+        csvEscape(h.subject),
+        csvEscape(h.bucket),
+        csvEscape(h.usedtobe ?? ""),
+        h.magnetUsed ? "1" : "0",
+      ].join(",")),
+    ];
+    return new Response(lines.join("\r\n"), {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="popfile-history.csv"`,
+      },
+    });
   }
 
   async #doHistoryRetrain(req: Request, bayes: Bayes, session: string): Promise<Response> {
     const form = await req.formData();
     const id = parseInt(form.get("id") as string, 10);
     const bucket = (form.get("bucket") as string)?.trim();
+    const back = (form.get("back") as string | null)?.trim() || "/history";
     if (!isNaN(id) && bucket) {
       try {
         bayes.retrainHistory(session, id, bucket);
@@ -655,7 +910,7 @@ export class UIServer extends Module {
         this.log_(0, `Retrain error: ${e}`);
       }
     }
-    return Response.redirect(new URL("/history", req.url), 303);
+    return Response.redirect(new URL(back, req.url), 303);
   }
 
   // -------------------------------------------------------------------------

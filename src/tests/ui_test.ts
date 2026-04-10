@@ -31,11 +31,12 @@ interface UIStack {
   session: string;
   baseUrl: string;
   cookie: string;
+  tmpDir: string;
   cleanup: () => Promise<void>;
 }
 
-async function makeUIStack(): Promise<UIStack> {
-  const tmpDir = await Deno.makeTempDir();
+async function makeUIStack(existingTmpDir?: string): Promise<UIStack> {
+  const tmpDir = existingTmpDir ?? await Deno.makeTempDir();
   const loader = new Loader();
 
   loader.register("config",     new Configuration(), 0);
@@ -87,7 +88,7 @@ async function makeUIStack(): Promise<UIStack> {
     Deno.removeSync(tmpDir, { recursive: true });
   };
 
-  return { ui, bayes, session, baseUrl, cookie, cleanup };
+  return { ui, bayes, session, baseUrl, cookie, tmpDir, cleanup };
 }
 
 // ---------------------------------------------------------------------------
@@ -217,23 +218,218 @@ Deno.test("UIServer: GET /magnets returns 200 HTML", async () => {
   } finally { await cleanup(); }
 });
 
-Deno.test("UIServer: GET /history returns 200 HTML", async () => {
+Deno.test("UIServer: GET /history returns 200 HTML with filter bar", async () => {
   const { baseUrl, cookie, cleanup } = await makeUIStack();
   try {
     const res = await get(baseUrl, "/history", cookie);
     assertEquals(res.status, 200);
     const body = await res.text();
-    assert(body.length > 0);
+    assert(body.includes("Filter"), "Expected filter bar");
+    assert(body.includes("Export CSV"), "Expected export link");
   } finally { await cleanup(); }
 });
 
-Deno.test("UIServer: GET /classify returns 200 HTML", async () => {
+Deno.test("UIServer: GET /history?bucket= filters by bucket", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    // Classify a message so history is non-empty
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+
+    const res = await get(baseUrl, "/history?bucket=spam", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("spam"), "Expected spam filter applied");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /history?q= searches subject/from", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML); // subject: "Hello world"
+    try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+
+    const resMatch = await get(baseUrl, "/history?q=Hello", cookie);
+    assertEquals(resMatch.status, 200);
+    const matchBody = await resMatch.text();
+    assert(matchBody.includes("Hello world") || matchBody.includes("1 message"),
+      "Expected matching message in results");
+
+    const resNoMatch = await get(baseUrl, "/history?q=xyzzy_not_present", cookie);
+    assertEquals(resNoMatch.status, 200);
+    const noMatchBody = await resNoMatch.text();
+    assert(noMatchBody.includes("No matching"), "Expected empty result for non-matching search");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /history pagination shows page controls", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    // Create 30 history entries (more than one page of 25)
+    for (let i = 0; i < 30; i++) {
+      const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+      await Deno.writeTextFile(tmp,
+        `From: a@b.com\r\nTo: b@c.com\r\nSubject: msg${i}\r\nContent-Type: text/plain\r\n\r\nhello`);
+      try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+    }
+    const res = await get(baseUrl, "/history", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("Next →"), "Expected next page link");
+    assert(body.includes("Page 1 of"), "Expected page indicator");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /history/export returns CSV", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+
+    const res = await get(baseUrl, "/history/export", cookie);
+    assertEquals(res.status, 200);
+    const ct = res.headers.get("content-type") ?? "";
+    assert(ct.includes("text/csv"), `Expected CSV content-type, got: ${ct}`);
+    const cd = res.headers.get("content-disposition") ?? "";
+    assert(cd.includes(".csv"), "Expected CSV filename in Content-Disposition");
+    const body = await res.text();
+    assert(body.startsWith("id,date,from,subject"), "Expected CSV header row");
+    // Should have at least one data row
+    const lines = body.trim().split("\n");
+    assert(lines.length >= 2, "Expected header + at least one data row");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /history/export respects bucket filter", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+
+    const res = await get(baseUrl, "/history/export?bucket=spam", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    const lines = body.trim().split("\n");
+    // Only header, no data rows (nothing classified as spam)
+    assertEquals(lines.length, 1, "Expected only header row when no matching messages");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /history/retrain redirects back to same page", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.createBucket(session, "spam");
+    const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+    await Deno.writeTextFile(tmp, SAMPLE_EML);
+    try { bayes.classify(session, tmp); } finally { await Deno.remove(tmp); }
+
+    const [entry] = bayes.getHistory(session);
+    const form = new URLSearchParams({
+      id: String(entry.id),
+      bucket: "spam",
+      back: "/history?page=2&bucket=inbox",
+    });
+    const res = await post(baseUrl, "/history/retrain", form, cookie);
+    assert(res.status === 302 || res.status === 303);
+    const location = res.headers.get("location") ?? "";
+    assert(location.includes("page=2") && location.includes("bucket=inbox"),
+      `Expected redirect to preserve filters, got: ${location}`);
+    await res.body?.cancel();
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /classify returns 200 HTML with file upload form", async () => {
   const { baseUrl, cookie, cleanup } = await makeUIStack();
   try {
     const res = await get(baseUrl, "/classify", cookie);
     assertEquals(res.status, 200);
     const body = await res.text();
-    assert(body.length > 0);
+    assert(body.includes('type="file"'), "Expected file upload input");
+    assert(body.includes('enctype="multipart/form-data"'), "Expected multipart form");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /classify with file upload returns classification result", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.createBucket(session, "spam");
+    const formData = new FormData();
+    formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Cookie": cookie },
+      body: formData,
+    });
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("Result:"), `Expected classification result, got: ${body.substring(0, 200)}`);
+    assert(body.includes("word scores"), "Expected word scores link");
+    assert(body.includes("Train as"), "Expected train correction form");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /classify with trained message shows correct bucket", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    // Train spam words heavily
+    const spamEml = [
+      "From: spammer@bad.com",
+      "To: victim@example.com",
+      "Subject: Buy cheap viagra now",
+      "Content-Type: text/plain",
+      "",
+      "Buy viagra cheap pills discount pharmacy offer limited",
+      "Buy viagra cheap pills discount pharmacy offer limited",
+      "Buy viagra cheap pills discount pharmacy offer limited",
+    ].join("\r\n");
+    const inboxEml = [
+      "From: boss@work.com",
+      "To: me@work.com",
+      "Subject: Meeting tomorrow",
+      "Content-Type: text/plain",
+      "",
+      "Can we schedule a meeting tomorrow to discuss the project status?",
+    ].join("\r\n");
+    // Train 5 copies of each so Bayes has enough signal
+    for (let i = 0; i < 5; i++) {
+      const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+      await Deno.writeTextFile(tmp, spamEml);
+      bayes.trainMessage(session, "spam", new (await import("../classifier/MailParser.ts")).MailParser().parseFile(tmp));
+      await Deno.remove(tmp);
+    }
+    for (let i = 0; i < 5; i++) {
+      const tmp = await Deno.makeTempFile({ suffix: ".eml" });
+      await Deno.writeTextFile(tmp, inboxEml);
+      bayes.trainMessage(session, "inbox", new (await import("../classifier/MailParser.ts")).MailParser().parseFile(tmp));
+      await Deno.remove(tmp);
+    }
+
+    const formData = new FormData();
+    formData.append("upload", new File([spamEml], "spam.eml", { type: "message/rfc822" }));
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Cookie": cookie },
+      body: formData,
+    });
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("spam"), `Expected spam in result, got: ${body.substring(0, 300)}`);
   } finally { await cleanup(); }
 });
 
@@ -432,5 +628,93 @@ Deno.test("UIServer: POST /users/delete removes a user", async () => {
     await res.body?.cancel();
     const users = bayes.listUsers(session);
     assert(!users.some((u) => u.name === "bob"), "User bob should have been deleted");
+  } finally { await cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Training UI — file upload and bulk import
+// ---------------------------------------------------------------------------
+
+const SAMPLE_EML = [
+  "From: alice@example.com",
+  "To: bob@example.com",
+  "Subject: Hello world",
+  "Content-Type: text/plain",
+  "",
+  "This is a test message for training.",
+].join("\r\n");
+
+Deno.test("UIServer: GET /train shows file upload form", async () => {
+  const { baseUrl, cookie, cleanup } = await makeUIStack();
+  try {
+    const res = await get(baseUrl, "/train", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes('type="file"'), "Expected file upload input");
+    assert(body.includes('enctype="multipart/form-data"'), "Expected multipart form");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /train with file upload trains the message", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    const before = bayes.getBucketWordCount(session, "inbox");
+
+    const formData = new FormData();
+    formData.append("bucket", "inbox");
+    formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
+
+    const res = await fetch(`${baseUrl}/train`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Cookie": cookie },
+      body: formData,
+    });
+    const body = await res.text();
+    assertEquals(res.status, 200);
+    assert(body.includes("Trained"), `Expected success message, got: ${body.substring(0, 200)}`);
+
+    const after = bayes.getBucketWordCount(session, "inbox");
+    assert(after > before, "Word count should have increased after training");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /train/import imports .eml files from training dir", async () => {
+  const { baseUrl, bayes, session, cookie, tmpDir, cleanup } = await makeUIStack();
+  try {
+    // Create training/spam/ with two .eml files
+    await Deno.mkdir(`${tmpDir}/training/spam`, { recursive: true });
+    await Deno.writeTextFile(`${tmpDir}/training/spam/1.eml`, SAMPLE_EML);
+    await Deno.writeTextFile(`${tmpDir}/training/spam/2.eml`, SAMPLE_EML);
+
+    const form = new URLSearchParams({ bucket: "spam" });
+    const res = await fetch(`${baseUrl}/train/import`, {
+      method: "POST", redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie },
+      body: form,
+    });
+    const body = await res.text();
+    assertEquals(res.status, 200);
+    assert(body.includes("spam"), `Expected spam in result: ${body.substring(0, 300)}`);
+    assert(body.includes("trained"), "Expected trained count in result");
+
+    const wc = bayes.getBucketWordCount(session, "spam");
+    assert(wc > 0, "Expected word count > 0 after import");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /train shows bulk import section when training/ dir exists", async () => {
+  const { baseUrl, cookie, tmpDir, cleanup } = await makeUIStack();
+  try {
+    // Create training/inbox/ with one .eml
+    await Deno.mkdir(`${tmpDir}/training/inbox`, { recursive: true });
+    await Deno.writeTextFile(`${tmpDir}/training/inbox/msg.eml`, SAMPLE_EML);
+
+    const res = await get(baseUrl, "/train", cookie);
+    const body = await res.text();
+    assertEquals(res.status, 200);
+    assert(body.includes("Bulk import"), "Expected bulk import section");
+    assert(body.includes("inbox"), "Expected inbox bucket listed");
   } finally { await cleanup(); }
 });

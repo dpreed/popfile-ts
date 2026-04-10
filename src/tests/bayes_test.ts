@@ -417,6 +417,106 @@ Deno.test("Bayes: retrainHistory corrects the bucket", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// History pagination and filtering
+// ---------------------------------------------------------------------------
+
+Deno.test("Bayes: getHistoryCount returns 0 with no history", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  assertEquals(bayes.getHistoryCount(session), 0);
+  cleanup();
+});
+
+Deno.test("Bayes: getHistoryCount increments after classify", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const f = await makeEml("Subject: test\r\n\r\nhello world");
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "inbox", parser.parse("Subject: t\r\n\r\nhello world"));
+    bayes.classify(session, f);
+    assertEquals(bayes.getHistoryCount(session), 1);
+    bayes.classify(session, f);
+    assertEquals(bayes.getHistoryCount(session), 2);
+  } finally { await Deno.remove(f); cleanup(); }
+});
+
+Deno.test("Bayes: getHistory pagination — offset and limit work", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const files: string[] = [];
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "inbox", parser.parse("Subject: t\r\n\r\nhello world"));
+    for (let i = 0; i < 5; i++) {
+      const f = await makeEml(`Subject: msg${i}\r\n\r\nhello`);
+      files.push(f);
+      bayes.classify(session, f);
+    }
+    const page1 = bayes.getHistory(session, { limit: 3, offset: 0 });
+    const page2 = bayes.getHistory(session, { limit: 3, offset: 3 });
+    assertEquals(page1.length, 3);
+    assertEquals(page2.length, 2);
+    // No overlap
+    const ids1 = new Set(page1.map((r) => r.id));
+    assert(page2.every((r) => !ids1.has(r.id)));
+  } finally {
+    for (const f of files) await Deno.remove(f).catch(() => {});
+    cleanup();
+  }
+});
+
+Deno.test("Bayes: getHistory bucket filter narrows results", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const files: string[] = [];
+  try {
+    bayes.createBucket(session, "spam");
+    bayes.createBucket(session, "inbox");
+    for (const t of ["buy pills cheap", "free money now"]) {
+      bayes.trainMessage(session, "spam", parser.parse(`Subject: s\r\n\r\n${t}`));
+    }
+    for (const t of ["meeting agenda", "project update"]) {
+      bayes.trainMessage(session, "inbox", parser.parse(`Subject: i\r\n\r\n${t}`));
+    }
+    // Classify known-spam message
+    const spamFile = await makeEml("Subject: buy\r\n\r\nbuy pills cheap free money now");
+    files.push(spamFile);
+    bayes.classify(session, spamFile);
+
+    const all = bayes.getHistory(session);
+    const spamOnly = bayes.getHistory(session, { bucket: "spam" });
+    const inboxOnly = bayes.getHistory(session, { bucket: "inbox" });
+    assert(all.length >= spamOnly.length);
+    assert(spamOnly.every((r) => r.bucket === "spam"));
+    assert(inboxOnly.every((r) => r.bucket === "inbox"));
+  } finally {
+    for (const f of files) await Deno.remove(f).catch(() => {});
+    cleanup();
+  }
+});
+
+Deno.test("Bayes: getHistory search filter matches subject", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  const parser = new MailParser();
+  const files: string[] = [];
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.trainMessage(session, "inbox", parser.parse("Subject: t\r\n\r\nhello world"));
+    const f1 = await makeEml("Subject: hello world\r\n\r\nhello");
+    const f2 = await makeEml("Subject: unrelated topic\r\n\r\nhello");
+    files.push(f1, f2);
+    bayes.classify(session, f1);
+    bayes.classify(session, f2);
+    const results = bayes.getHistory(session, { search: "hello" });
+    assert(results.length >= 1);
+    assert(results.every((r) => r.subject.toLowerCase().includes("hello")));
+  } finally {
+    for (const f of files) await Deno.remove(f).catch(() => {});
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 

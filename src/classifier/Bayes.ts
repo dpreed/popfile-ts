@@ -265,10 +265,26 @@ export class Bayes extends Module {
     return result;
   }
 
-  getHistory(sessionKey: string, limit = 100): HistoryRow[] {
+  getHistory(
+    sessionKey: string,
+    opts: { limit?: number; offset?: number; bucket?: string; search?: string } = {},
+  ): HistoryRow[] {
     const userId = this.#validSession(sessionKey);
     if (userId === null) throw new Error("Invalid session key");
+    const { limit = 25, offset = 0, bucket, search } = opts;
     const db = this.db_();
+    const filters: string[] = ["h.userid = ?"];
+    const params: (string | number)[] = [userId];
+    if (bucket) {
+      filters.push("COALESCE(b.name, 'unclassified') = ?");
+      params.push(bucket);
+    }
+    if (search) {
+      filters.push("(h.subject LIKE ? OR h.from_address LIKE ?)");
+      const like = `%${search}%`;
+      params.push(like, like);
+    }
+    const where = filters.join(" AND ");
     const rows = db.prepare(`
       SELECT h.id, h.filename, h.date, h.from_address, h.subject,
              COALESCE(b.name, 'unclassified') AS bucket,
@@ -277,15 +293,43 @@ export class Bayes extends Module {
       FROM history h
       LEFT JOIN buckets b  ON h.bucketid = b.id
       LEFT JOIN buckets ub ON h.usedtobe = ub.id
-      WHERE h.userid = ?
+      WHERE ${where}
       ORDER BY h.date DESC
-      LIMIT ?
-    `).values<[number, string, number, string, string, string, string | null, number]>(userId, limit);
+      LIMIT ? OFFSET ?
+    `).values<[number, string, number, string, string, string, string | null, number]>(...params, limit, offset);
     return rows.map(([id, filename, date, fromAddress, subject, bucket, usedtobe, magnetUsed]) => ({
       id, filename, date, fromAddress, subject, bucket,
       usedtobe: usedtobe ?? null,
       magnetUsed: magnetUsed === 1,
     }));
+  }
+
+  getHistoryCount(
+    sessionKey: string,
+    opts: { bucket?: string; search?: string } = {},
+  ): number {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    const { bucket, search } = opts;
+    const db = this.db_();
+    const filters: string[] = ["h.userid = ?"];
+    const params: (string | number)[] = [userId];
+    if (bucket) {
+      filters.push("COALESCE(b.name, 'unclassified') = ?");
+      params.push(bucket);
+    }
+    if (search) {
+      filters.push("(h.subject LIKE ? OR h.from_address LIKE ?)");
+      const like = `%${search}%`;
+      params.push(like, like);
+    }
+    const where = filters.join(" AND ");
+    const row = db.prepare(`
+      SELECT COUNT(*) FROM history h
+      LEFT JOIN buckets b ON h.bucketid = b.id
+      WHERE ${where}
+    `).value<[number]>(...params);
+    return row ? row[0] : 0;
   }
 
   retrainHistory(sessionKey: string, historyId: number, newBucket: string): void {

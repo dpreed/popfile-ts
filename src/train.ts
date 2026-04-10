@@ -58,11 +58,21 @@ loader.register("database", new Database(), 2);
 loader.register("classifier", new Bayes(), 3);
 
 const config = loader.getModule("config") as Configuration;
+
+const userDir = Deno.env.get("POPFILE_USER_DIR") ?? "./";
+config.parameter("config_user_dir", userDir);
+config.parameter("config_root_dir", userDir);
 config.parameter("logger_log_level", "0");
 
 const modules = ["config", "mq", "logger", "database", "classifier"];
 for (const alias of modules) loader.getModule(alias).initialize();
-for (const alias of modules) loader.getModule(alias).start();
+
+// Start config first so popfile.cfg is loaded, then re-apply user dir so any
+// stale GLOBAL_user_dir in the cfg file cannot override the env var (or default).
+loader.getModule("config").start();
+config.parameter("GLOBAL_user_dir", userDir);
+config.parameter("GLOBAL_root_dir", userDir);
+for (const alias of modules.slice(1)) loader.getModule(alias).start();
 
 const bayes = loader.getModule("classifier") as Bayes;
 const session = bayes.getAdministratorSessionKey();
