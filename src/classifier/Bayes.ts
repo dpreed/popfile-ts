@@ -95,6 +95,8 @@ export class Bayes extends Module {
   // Per-user pre-computed constants (updated when training changes)
   #notLikely: Map<number, number> = new Map();      // userid → log(1/totalWords)
   #bucketStart: Map<number, Map<string, number>> = new Map(); // userid → bucket → log(prior)
+  #bucketWordCounts: Map<number, Map<string, number>> = new Map(); // userid → bucket → total words
+  #bucketsCache: Map<number, Bucket[]> = new Map(); // userid → bucket list
 
   // Session management
   #sessions: Map<string, { userId: number; expires: number }> = new Map();
@@ -459,10 +461,10 @@ export class Bayes extends Module {
     if (wordList.length === 0) return { ...result, wordScores: [] };
 
     const db = this.db_();
-    const buckets = this.#getBuckets(userId).filter((b) => !b.pseudo);
+    const buckets = (this.#bucketsCache.get(userId) ?? this.#getBuckets(userId)).filter((b) => !b.pseudo);
     if (buckets.length < 2) return { ...result, wordScores: [] };
 
-    const bucketTotalWords = this.#getBucketWordCounts(userId);
+    const bucketTotalWords = this.#bucketWordCounts.get(userId) ?? this.#getBucketWordCounts(userId);
 
     // Resolve word→id for words we know about
     const ph = wordList.map(() => "?").join(",");
@@ -518,7 +520,7 @@ export class Bayes extends Module {
 
   /** Classify an already-parsed message (used internally). */
   classifyParsed(userId: number, parsed: ParseResult): ClassifyResultInternal {
-    const buckets = this.#getBuckets(userId);
+    const buckets = this.#bucketsCache.get(userId) ?? this.#getBuckets(userId);
     const emptyResult: ClassifyResultInternal = {
       bucket: "unclassified",
       scores: new Map(),
@@ -586,7 +588,7 @@ export class Bayes extends Module {
 
     // 5. Bayes scoring loop (log-probability accumulation)
     const score = new Map<string, number>();
-    const bucketTotalWords = this.#getBucketWordCounts(userId);
+    const bucketTotalWords = this.#bucketWordCounts.get(userId) ?? this.#getBucketWordCounts(userId);
 
     for (const b of activeBuckets) {
       score.set(b.name, startMap.get(b.name) ?? 0);
@@ -863,8 +865,10 @@ export class Bayes extends Module {
       const grandTotal = [...totals.values()].reduce((s, v) => s + v, 0);
 
       this.#notLikely.set(uid, grandTotal > 0 ? Math.log(1 / grandTotal) : 0);
+      this.#bucketWordCounts.set(uid, totals);
 
       const buckets = this.#getBuckets(uid);
+      this.#bucketsCache.set(uid, buckets);
       const startMap = new Map<string, number>();
       for (const b of buckets) {
         const bTotal = totals.get(b.name) ?? 0;
