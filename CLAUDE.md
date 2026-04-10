@@ -130,6 +130,6 @@ The web UI requires login. The default admin account has username **admin** and 
 
 Each user's buckets, history, magnets, and training data are isolated. Non-admin users cannot access `/users`. The admin session cookie is named `popfile_session`.
 
-### Not yet ported
+### Intentionally not ported
 
-`UI::XMLRPC`. Each maps 1:1 to a Perl module and can be added without touching core infrastructure.
+`UI::XMLRPC` — the XML-RPC API used by the original Windows tray app and some third-party scripts. Not needed for the core classification workflow.
