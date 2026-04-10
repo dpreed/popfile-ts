@@ -543,7 +543,8 @@ export class UIServer extends Module {
     if (!this.#verifyCsrf(session, form)) return new Response("Invalid CSRF token", { status: 403 });
     const name = (form.get("name") as string | null)?.trim();
     const color = (form.get("color") as string | null)?.trim();
-    if (name && color) bayes.setBucketColor(session, name, color);
+    // Only accept the #rrggbb format produced by <input type="color">
+    if (name && color && /^#[0-9a-fA-F]{6}$/.test(color)) bayes.setBucketColor(session, name, color);
     return Response.redirect(new URL("/buckets", req.url), 303);
   }
 
@@ -1520,7 +1521,8 @@ function esc(s: string): string {
 }
 
 function dot(color: string): string {
-  return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${esc(color)};margin-right:5px;vertical-align:middle"></span>`;
+  // colorToHex normalises to #rrggbb or falls back to #000000 — safe in CSS context
+  return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${colorToHex(color)};margin-right:5px;vertical-align:middle"></span>`;
 }
 
 /** Convert a CSS colour name or hex value to a 6-digit hex string for <input type=color>. */
