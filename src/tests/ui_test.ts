@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * tests/ui_test.ts — HTTP route tests for UIServer.
  *

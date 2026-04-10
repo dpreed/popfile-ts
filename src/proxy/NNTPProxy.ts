@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * NNTPProxy.ts — NNTP proxy with inline Bayes classification.
  *

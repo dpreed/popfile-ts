@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * main.ts — POPFile entry point for Deno.
  *

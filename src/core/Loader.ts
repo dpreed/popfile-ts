@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * Loader.ts — Boot sequencer for POPFile modules.
  *

@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * POP3SProxy.ts — POP3 proxy with TLS upstream (POP3S / port 995).
  *

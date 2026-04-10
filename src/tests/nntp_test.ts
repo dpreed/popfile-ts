@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * tests/nntp_test.ts — End-to-end tests for NNTPProxy.
  *

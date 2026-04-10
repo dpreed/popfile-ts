@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * tests/bayes_test.ts — Tests for the Bayes classifier module.
  *

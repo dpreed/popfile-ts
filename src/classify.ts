@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * classify.ts — CLI tool to classify one or more .eml files.
  *

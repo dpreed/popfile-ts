@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * tests/core_test.ts — Tests for Configuration and MessageQueue modules.
  *

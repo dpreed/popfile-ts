@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * train.ts — CLI tool to bulk-train .eml files into a bucket.
  *

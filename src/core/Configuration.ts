@@ -1,3 +1,4 @@
+// Copyright (c) 2025 David P. Reed. MIT License.
 /**
  * Configuration.ts — Persistent key-value configuration store.
  *
