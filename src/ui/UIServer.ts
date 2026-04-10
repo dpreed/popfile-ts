@@ -38,6 +38,8 @@ export class UIServer extends Module {
   #needsPasswordChange: Set<string> = new Set();
   /** Failed login attempt counts per remote IP. */
   #loginAttempts: Map<string, { count: number; until: number }> = new Map();
+  /** Pre-authentication CSRF tokens for the login form: token → expiry timestamp. */
+  #loginCsrfTokens: Map<string, number> = new Map();
 
   constructor() {
     super();
@@ -113,6 +115,7 @@ export class UIServer extends Module {
     this.#csrfTokens.clear();
     this.#needsPasswordChange.clear();
     this.#loginAttempts.clear();
+    this.#loginCsrfTokens.clear();
     super.stop();
   }
 
@@ -176,6 +179,25 @@ export class UIServer extends Module {
   #clearCookie(): string {
     const secure = this.config_("tls") === "1" ? "; Secure" : "";
     return `popfile_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`;
+  }
+
+  /** Issue a single-use CSRF token for the login form (15-minute TTL). */
+  #issueLoginCsrf(): string {
+    // Sweep expired tokens to prevent unbounded growth
+    const now = Date.now();
+    for (const [t, exp] of this.#loginCsrfTokens) {
+      if (now >= exp) this.#loginCsrfTokens.delete(t);
+    }
+    const token = this.#generateToken();
+    this.#loginCsrfTokens.set(token, now + 15 * 60 * 1000);
+    return token;
+  }
+
+  /** Verify and consume a login CSRF token. Returns false if missing or expired. */
+  #verifyLoginCsrf(token: string): boolean {
+    const exp = this.#loginCsrfTokens.get(token);
+    this.#loginCsrfTokens.delete(token); // always consume — single use
+    return !!exp && Date.now() < exp;
   }
 
   #generateToken(): string {
@@ -296,11 +318,13 @@ export class UIServer extends Module {
   // -------------------------------------------------------------------------
 
   #pageLogin(error?: string): Response {
+    const loginCsrf = this.#issueLoginCsrf();
     const body = `
       <div style="max-width:360px;margin:60px auto">
         <h2 style="margin-bottom:20px">Sign in to POPFile</h2>
         ${error ? `<div class="error" style="margin-bottom:16px">${esc(error)}</div>` : ""}
         <form method="POST" action="/login" style="display:flex;flex-direction:column;gap:12px">
+          <input type="hidden" name="_login_csrf" value="${loginCsrf}">
           <label>Username
             <input type="text" name="username" autocomplete="username" required style="width:100%">
           </label>
@@ -326,7 +350,14 @@ export class UIServer extends Module {
         .error{background:#fdf0ef;border-left:3px solid #c0392b;padding:12px 16px;border-radius:4px;color:#c0392b;font-size:.9rem}
         p{margin-bottom:12px;color:#555;font-size:.9rem}
       </style></head><body>${body}</body></html>`,
-      { headers: { "Content-Type": "text/html; charset=utf-8" } }
+      {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "SAMEORIGIN",
+          "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'",
+        },
+      }
     );
   }
 
@@ -336,6 +367,11 @@ export class UIServer extends Module {
     }
 
     const form = await req.formData();
+    const loginCsrf = (form.get("_login_csrf") as string | null) ?? "";
+    if (!this.#verifyLoginCsrf(loginCsrf)) {
+      return this.#pageLogin("Invalid request. Please try again.");
+    }
+
     const username = (form.get("username") as string | null)?.trim() ?? "";
     const password = (form.get("password") as string | null) ?? "";
 

@@ -68,12 +68,18 @@ async function makeUIStack(existingTmpDir?: string): Promise<UIStack> {
   const port = ui.getListenPort();
   const baseUrl = `http://127.0.0.1:${port}`;
 
+  // Fetch login page to get the login CSRF token
+  const loginPageRes = await fetch(`${baseUrl}/login`, { redirect: "manual" });
+  const loginPageHtml = await loginPageRes.text();
+  const loginCsrfMatch = /name="_login_csrf" value="([^"]+)"/.exec(loginPageHtml);
+  const loginCsrf = loginCsrfMatch?.[1] ?? "";
+
   // Log in via the UI to get a browser session cookie (admin / blank password)
   const loginRes = await fetch(`${baseUrl}/login`, {
     method: "POST",
     redirect: "manual",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ username: "admin", password: "" }),
+    body: new URLSearchParams({ username: "admin", password: "", _login_csrf: loginCsrf }),
   });
   await loginRes.body?.cancel();
   const setCookie = loginRes.headers.get("set-cookie") ?? "";
@@ -151,14 +157,36 @@ Deno.test("UIServer: GET /login returns 200 HTML", async () => {
   } finally { await cleanup(); }
 });
 
-Deno.test("UIServer: POST /login with bad credentials returns 200 with error", async () => {
+Deno.test("UIServer: POST /login without CSRF token returns login page with error", async () => {
   const { baseUrl, cleanup } = await makeUIStack();
   try {
     const res = await fetch(`${baseUrl}/login`, {
       method: "POST",
       redirect: "manual",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ username: "admin", password: "wrongpassword" }),
+      body: new URLSearchParams({ username: "admin", password: "" }),
+    });
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("Invalid request") || body.includes("try again"), "Expected CSRF error");
+  } finally { await cleanup(); }
+});
+
+async function fetchLoginCsrf(baseUrl: string): Promise<string> {
+  const res = await fetch(`${baseUrl}/login`, { redirect: "manual" });
+  const html = await res.text();
+  return /name="_login_csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
+}
+
+Deno.test("UIServer: POST /login with bad credentials returns 200 with error", async () => {
+  const { baseUrl, cleanup } = await makeUIStack();
+  try {
+    const loginCsrf = await fetchLoginCsrf(baseUrl);
+    const res = await fetch(`${baseUrl}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "admin", password: "wrongpassword", _login_csrf: loginCsrf }),
     });
     assertEquals(res.status, 200);
     const body = await res.text();
@@ -169,11 +197,12 @@ Deno.test("UIServer: POST /login with bad credentials returns 200 with error", a
 Deno.test("UIServer: POST /login with correct credentials redirects with cookie", async () => {
   const { baseUrl, cleanup } = await makeUIStack();
   try {
+    const loginCsrf = await fetchLoginCsrf(baseUrl);
     const res = await fetch(`${baseUrl}/login`, {
       method: "POST",
       redirect: "manual",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ username: "admin", password: "" }),
+      body: new URLSearchParams({ username: "admin", password: "", _login_csrf: loginCsrf }),
     });
     assertEquals(res.status, 303);
     assert(res.headers.get("set-cookie")?.includes("popfile_session="), "Expected session cookie");
@@ -879,26 +908,26 @@ Deno.test("UIServer: GET /login?expired=1 shows session-expired message", async 
 // Brute-force protection
 // ---------------------------------------------------------------------------
 
+async function loginAttempt(baseUrl: string, password: string): Promise<Response> {
+  const loginCsrf = await fetchLoginCsrf(baseUrl);
+  return await fetch(`${baseUrl}/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username: "admin", password, _login_csrf: loginCsrf }),
+  });
+}
+
 Deno.test("UIServer: 10 failed logins trigger rate limit", async () => {
   const { baseUrl, cleanup } = await makeUIStack();
   try {
-    // Send 10 bad-password attempts (threshold)
+    // Send 10 bad-password attempts (threshold) — each needs a fresh CSRF token
     for (let i = 0; i < 10; i++) {
-      const res = await fetch(`${baseUrl}/login`, {
-        method: "POST",
-        redirect: "manual",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ username: "admin", password: "wrong" }),
-      });
+      const res = await loginAttempt(baseUrl, "wrong");
       await res.body?.cancel();
     }
     // 11th attempt should hit the rate limit
-    const res = await fetch(`${baseUrl}/login`, {
-      method: "POST",
-      redirect: "manual",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ username: "admin", password: "" }),
-    });
+    const res = await loginAttempt(baseUrl, "");
     assertEquals(res.status, 200);
     const body = await res.text();
     assert(body.includes("Too many") || body.includes("rate") || body.includes("later"),
@@ -911,32 +940,17 @@ Deno.test("UIServer: successful login clears failed-attempt counter", async () =
   try {
     // 9 failures (one below threshold)
     for (let i = 0; i < 9; i++) {
-      const r = await fetch(`${baseUrl}/login`, {
-        method: "POST",
-        redirect: "manual",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ username: "admin", password: "bad" }),
-      });
+      const r = await loginAttempt(baseUrl, "bad");
       await r.body?.cancel();
     }
     // Successful login — clears the counter
-    const ok = await fetch(`${baseUrl}/login`, {
-      method: "POST",
-      redirect: "manual",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ username: "admin", password: "" }),
-    });
+    const ok = await loginAttempt(baseUrl, "");
     assert(ok.status === 302 || ok.status === 303, `Expected redirect on success, got ${ok.status}`);
     await ok.body?.cancel();
 
     // Another 9 failures should still be allowed (counter was reset)
     for (let i = 0; i < 9; i++) {
-      const r = await fetch(`${baseUrl}/login`, {
-        method: "POST",
-        redirect: "manual",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ username: "admin", password: "bad" }),
-      });
+      const r = await loginAttempt(baseUrl, "bad");
       assertEquals(r.status, 200);
       const b = await r.text();
       assert(!b.includes("Too many"), "Should not be rate-limited after counter reset");
