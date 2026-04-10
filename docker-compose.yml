@@ -1,0 +1,24 @@
+services:
+  popfile:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # Web UI (POPFILE_UI_PORT)
+      - "1110:1110"   # POP3 proxy (POPFILE_POP3_PORT)
+      - "1995:1995"   # POP3S proxy (POPFILE_POP3S_PORT)
+      # Uncomment to expose optional proxy services:
+      # - "1025:1025" # SMTP proxy (requires POPFILE_SMTP_SERVER)
+      # - "1119:1119" # NNTP proxy (requires POPFILE_NNTP_SERVER)
+    volumes:
+      - ./data:/data
+      # Mount TLS certificates when HTTPS is enabled:
+      # - ./certs/cert.pem:/data/cert.pem:ro
+      # - ./certs/key.pem:/data/key.pem:ro
+    environment:
+      # All settings can also be changed in the web UI (Settings page).
+      # POPFILE_UI_PORT: "8080"
+      # POPFILE_POP3_PORT: "1110"
+      # POPFILE_POP3S_PORT: "1995"
+      # POPFILE_SMTP_SERVER: ""        # set to enable SMTP proxy
+      # POPFILE_NNTP_SERVER: ""        # set to enable NNTP proxy
+      # POPFILE_IMAP_SERVER: ""        # set to enable IMAP watcher

@@ -49,6 +49,9 @@ export class UIServer extends Module {
     this.config_("local", "1");
     this.config_("enabled", "1");
     this.config_("trusted_proxy", "0");
+    this.config_("tls", "0");
+    this.config_("tls_cert", "cert.pem");
+    this.config_("tls_key", "key.pem");
     return LifecycleResult.Ok;
   }
 
@@ -73,11 +76,29 @@ export class UIServer extends Module {
 
     const port = parseInt(this.config_("port"), 10);
     const hostname = this.config_("local") === "1" ? "127.0.0.1" : "0.0.0.0";
+    const useTls = this.config_("tls") === "1";
 
-    this.#server = Deno.serve(
-      { port, hostname, onListen: () => this.log_(0, `UI on http://${hostname}:${port}`) },
-      (req, info) => this.#handle(req, (info.remoteAddr as Deno.NetAddr).hostname),
-    );
+    if (useTls) {
+      const certPath = this.configuration_().getUserPath(this.config_("tls_cert"));
+      const keyPath  = this.configuration_().getUserPath(this.config_("tls_key"));
+      let cert: string, key: string;
+      try {
+        cert = Deno.readTextFileSync(certPath);
+        key  = Deno.readTextFileSync(keyPath);
+      } catch (e) {
+        this.log_(0, `UI TLS: cannot read cert/key: ${e}`);
+        return LifecycleResult.Fatal;
+      }
+      this.#server = Deno.serve(
+        { port, hostname, cert, key, onListen: () => this.log_(0, `UI on https://${hostname}:${port}`) },
+        (req, info) => this.#handle(req, (info.remoteAddr as Deno.NetAddr).hostname),
+      );
+    } else {
+      this.#server = Deno.serve(
+        { port, hostname, onListen: () => this.log_(0, `UI on http://${hostname}:${port}`) },
+        (req, info) => this.#handle(req, (info.remoteAddr as Deno.NetAddr).hostname),
+      );
+    }
     return LifecycleResult.Ok;
   }
 
@@ -143,6 +164,18 @@ export class UIServer extends Module {
       }
     }
     return null;
+  }
+
+  /** Build a Set-Cookie value for the session token. Adds Secure when TLS is enabled. */
+  #sessionCookie(token: string): string {
+    const secure = this.config_("tls") === "1" ? "; Secure" : "";
+    return `popfile_session=${token}; HttpOnly; Path=/; SameSite=Lax${secure}`;
+  }
+
+  /** Build a Set-Cookie value that clears the session cookie. */
+  #clearCookie(): string {
+    const secure = this.config_("tls") === "1" ? "; Secure" : "";
+    return `popfile_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`;
   }
 
   #generateToken(): string {
@@ -324,7 +357,7 @@ export class UIServer extends Module {
       status: 303,
       headers: {
         "Location": "/stats",
-        "Set-Cookie": `popfile_session=${token}; HttpOnly; Path=/; SameSite=Lax`,
+        "Set-Cookie": this.#sessionCookie(token),
       },
     });
   }
@@ -343,7 +376,7 @@ export class UIServer extends Module {
       status: 303,
       headers: {
         "Location": "/login",
-        "Set-Cookie": "popfile_session=; HttpOnly; Path=/; Max-Age=0",
+        "Set-Cookie": this.#clearCookie(),
       },
     });
   }
@@ -359,7 +392,7 @@ export class UIServer extends Module {
       status: 303,
       headers: {
         "Location": new URL("/login?expired=1", req.url).toString(),
-        "Set-Cookie": "popfile_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax",
+        "Set-Cookie": this.#clearCookie(),
       },
     });
   }
@@ -1248,11 +1281,18 @@ export class UIServer extends Module {
       },
       {
         title: "Security",
+        note: "TLS changes require restart to take effect.",
         fields: [
           { key: "GLOBAL_session_timeout", label: "Session timeout (seconds)", type: "number",
             hint: "Idle sessions expire after this many seconds; activity resets the timer (default 1800)" },
           { key: "ui_trusted_proxy", label: "Trust X-Forwarded-For", type: "checkbox",
             hint: "Enable when running behind a reverse proxy (nginx, Caddy, Traefik) so login rate-limiting uses the real client IP" },
+          { key: "ui_tls", label: "Enable HTTPS (TLS)", type: "checkbox",
+            hint: "Serve the web UI over HTTPS; requires cert and key files below" },
+          { key: "ui_tls_cert", label: "Certificate file", type: "text",
+            hint: "Path to PEM certificate (default cert.pem in data directory)" },
+          { key: "ui_tls_key", label: "Private key file", type: "text",
+            hint: "Path to PEM private key (default key.pem in data directory)" },
         ],
       },
       {
@@ -1374,6 +1414,7 @@ export class UIServer extends Module {
       "GLOBAL_message_cutoff",
       "GLOBAL_session_timeout",
       "ui_trusted_proxy",
+      "ui_tls", "ui_tls_cert", "ui_tls_key",
       "pop3_port", "pop3_local",
       "pop3s_port",
       "smtp_server", "smtp_server_port", "smtp_tls", "smtp_port", "smtp_local",
@@ -1385,7 +1426,7 @@ export class UIServer extends Module {
     ];
 
     const checkboxKeys = new Set([
-      "ui_trusted_proxy",
+      "ui_trusted_proxy", "ui_tls",
       "pop3_local", "smtp_tls", "smtp_local", "nntp_tls",
       "imap_tls", "imap_move", "ui_local",
     ]);
