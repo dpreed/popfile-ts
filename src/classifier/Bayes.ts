@@ -240,6 +240,14 @@ export class Bayes extends Module {
     this.#sessions.delete(key);
   }
 
+  /** Extend a session's expiry by the configured timeout (rolling window). No-op for admin/infinite sessions. */
+  touchSession(key: string): void {
+    const s = this.#sessions.get(key);
+    if (!s || s.expires === Infinity) return;
+    const timeout = parseInt(this.globalConfig_("session_timeout"), 10) * 1000;
+    s.expires = Date.now() + timeout;
+  }
+
   /** Release all active sessions (used in tests to simulate server-side timeout). */
   releaseAllSessions(): void {
     this.#sessions.clear();

@@ -1,175 +1,167 @@
-# POPFile — TypeScript/Deno Port
+# POPFile (TypeScript/Deno)
 
-A faithful port of [POPFile](http://getpopfile.org/) from Perl to TypeScript,
-running under [Deno](https://deno.land/). POPFile is a Naive Bayes email
-classifier that acts as a POP3 proxy, tagging each message with its predicted
-bucket (folder) via an `X-Text-Classification` header.
+A [Deno](https://deno.com/) port of [POPFile](http://getpopfile.org/), a Naive Bayes email classifier. POPFile sits between your mail client and your mail server, reads each message as it passes through, and adds an `X-Text-Classification` header so your client's filtering rules can sort it automatically.
 
----
+## Requirements
 
-## Architecture
+[Deno](https://deno.com/) 2.x
 
+```bash
+curl -fsSL https://deno.land/install.sh | sh
 ```
-src/
-├── main.ts                  Entry point — wires modules, calls loader.boot()
-├── classify.ts              CLI tool — classify .eml files from the command line
-├── core/
-│   ├── Module.ts            Base class for all POPFile modules
-│   ├── Loader.ts            Boot sequencer (run levels 0–5)
-│   ├── MessageQueue.ts      Async intra-process event bus (MQ)
-│   ├── Configuration.ts     Persistent key-value config (popfile.cfg)
-│   ├── Logger.ts            File-based logger + hourly TICKD events
-│   └── Database.ts          SQLite via @db/sqlite (schema v9)
-├── classifier/
-│   ├── MailParser.ts        MIME parser → word frequency map
-│   └── Bayes.ts             Naive Bayes classifier + magnets + sessions
-├── proxy/
-│   └── POP3Proxy.ts         POP3 proxy — intercepts RETR, tags messages
-├── ui/
-│   └── UIServer.ts          Web UI (Deno.serve) — buckets, magnets, classify
-└── tests/
-    └── classifier_test.ts   Tests for MailParser
-```
-
-### Module system
-
-Every subsystem extends `Module` (mirrors `POPFile::Module`). The `Loader`
-boots them in six run levels, guaranteeing correct initialization order:
-
-| Level | Modules |
-|-------|---------|
-| 0 | Configuration, MessageQueue |
-| 1 | Logger |
-| 2 | Database (SQLite) |
-| 3 | Classifier (Bayes) |
-| 4 | POP3Proxy |
-| 5 | UIServer |
-
-Modules communicate via the `MessageQueue` (event bus). Key message types:
-`TICKD` (hourly, from Logger), `COMIT` (message classified), `UIREG` (UI
-registration), `RELSE` (session released).
-
-### Classifier
-
-`Bayes.ts` implements log-probability Naive Bayes:
-
-1. `MailParser` tokenises the message → `Map<word, frequency>`
-2. Magnets are checked first (explicit string-match rules)
-3. Word IDs are looked up in SQLite; the word×bucket count matrix is fetched
-4. Log-probability scores are accumulated per bucket
-5. The winner needs to beat second place by `log(unclassified_weight)` or the
-   message is returned as `"unclassified"`
-6. Scores are exponentiated and normalized to probabilities (0–1)
-
-### Key differences from the Perl original
-
-| Perl | TypeScript/Deno |
-|------|----------------|
-| `fork()` per connection | `async/await` per connection |
-| DBI + SQLite | `@db/sqlite` (Deno native) |
-| `IO::Select` blocking I/O | `Deno.Conn` async streams |
-| `Crypt::OpenSSL::Random` | `crypto.getRandomValues()` |
-| `HTML::Parser` | Custom streaming HTML stripper |
-| `MIME::Base64` / `MIME::QuotedPrint` | `atob()` + custom QP decoder |
-| `Encode` (charset detection) | UTF-8 first, fallback to latin-1 |
-| Template Toolkit (`.thtml`) | Inline HTML generation |
-| `popfile.pl` + signals | `Loader.boot()` + `Deno.addSignalListener` |
-
----
 
 ## Quick start
 
-### Prerequisites
-
-- [Deno](https://deno.land/) 2.x
-
-### Run the full server
-
 ```bash
-deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi src/main.ts
+git clone <repo-url>
+cd popfile-ts
+deno task start
 ```
 
-The POP3 proxy starts on port **1110** (or `POPFILE_POP3_PORT`).
-The web UI starts on **http://127.0.0.1:8080** (or `POPFILE_UI_PORT`).
+Open **http://127.0.0.1:8080**. Default login: `admin` / *(blank password)*. Change it immediately via **Users → Change your password** — POPFile shows a warning banner until you do.
 
-### Environment variables
+## Mail client setup
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `POPFILE_USER_DIR` | `./` | Working directory for db, logs, messages |
-| `POPFILE_POP3_PORT` | `1110` | POP3 proxy listen port |
-| `POPFILE_UI_PORT` | `8080` | Web UI listen port |
+### POP3 (plain)
 
-### Classify a message from the CLI
+| Setting | Value |
+|---------|-------|
+| Server | `127.0.0.1` |
+| Port | `1110` |
+| Username | `youruser:mailserver.com` |
 
-```bash
-deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi \
-  src/classify.ts /path/to/message.eml
-```
+### POP3S (TLS to upstream)
 
-Output:
-```
-'/path/to/message.eml' → 'spam'
-  spam:   98.3412%
-  inbox:   1.6588%
-```
+| Setting | Value |
+|---------|-------|
+| Server | `127.0.0.1` |
+| Port | `1995` |
+| Encryption | **None** (POPFile handles TLS to the real server) |
+| Username | `youruser:mailserver.com` or `youruser:mailserver.com:995` |
 
-### Configure your email client
+Every retrieved message gets an `X-Text-Classification: <bucket>` header. Create a filtering rule in your client on that header to move mail into folders automatically.
 
-Set your POP3 server to `127.0.0.1` port `110` (or your chosen port).  
-Use the username format: `youruser:realserver.com` or `youruser:realserver.com:995`.
+## Training
 
-Each retrieved message will have an `X-Text-Classification: <bucket>` header
-added, which you can use in your mail client's filtering rules.
+POPFile learns from examples. Classification improves with more training data.
 
 ### Web UI
 
-Open **http://127.0.0.1:8080** to:
-- Create and delete classification buckets
-- Add magnets (explicit classification rules)
-- Classify individual messages interactively
-- View the JSON API at `/api/buckets` and `/api/classify?file=...`
+Go to **Train** to upload individual `.eml` files, or place `.eml` files under `training/<bucketname>/` and use the bulk import button.
 
----
-
-## Training the classifier
-
-POPFile learns by correction. After classifying a message incorrectly, call
-`trainMessage()` via the API to move the word counts to the right bucket.
-The more messages you train, the more accurate classification becomes.
-
-```typescript
-const session = bayes.getAdministratorSessionKey();
-const parsed = parser.parseFile("/path/to/message.eml");
-bayes.trainMessage(session, "spam", parsed);
-```
-
----
-
-## Running tests
+### CLI
 
 ```bash
-deno test --allow-read --allow-write --allow-net src/tests/
+# Train a directory (recursive)
+deno task train spam  ~/mail/spam/
+deno task train inbox ~/mail/inbox/
+
+# Train individual files
+deno task train spam msg1.eml msg2.eml
+
+# Classify from the command line
+deno task classify message.eml
 ```
 
----
+## Optional services
 
-## What is not yet ported
+### IMAP watcher
 
-The following Perl modules exist in the original codebase but are not yet
-implemented in this port:
+When enabled, POPFile polls a folder, classifies each message, and moves it into a subfolder named after its bucket (e.g. `spam`, `inbox`). Folders are created automatically.
 
-- **`Proxy::NNTP`** — NNTP (newsgroup) proxy
-- **`Proxy::SMTP`** — SMTP proxy with classification tagging
-- **`Proxy::POP3S`** — POP3 over SSL/TLS
-- **`Services::IMAP`** — IMAP service (connects directly to IMAP server)
-- **`UI::XMLRPC`** — XML-RPC API (the JSON `/api/*` routes cover the core)
-- **Multi-user support** — the schema supports it but the UI only exposes
-  the admin user
-- **History page** — the `history` table is created but not surfaced in the UI
-- **Bucket colours** — stored in `bucket_params` but not rendered in the UI
-- **Japanese/Korean tokenisation** — the Perl source has special handling for
-  CJK character sets; the TS port falls back to Unicode codepoint boundaries
+Set via environment variables or the **Settings** page:
 
-These are all well-contained additions — each maps 1:1 to a Perl module and
-can be added without touching the core infrastructure.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POPFILE_IMAP_SERVER` | *(disabled)* | IMAP hostname — required to enable |
+| `POPFILE_IMAP_PORT` | `143` | Port (`993` for TLS) |
+| `POPFILE_IMAP_TLS` | `0` | TLS: `0` or `1` |
+| `POPFILE_IMAP_USERNAME` | — | Login username |
+| `POPFILE_IMAP_PASSWORD` | — | Login password |
+| `POPFILE_IMAP_WATCH_FOLDER` | `INBOX` | Folder to monitor |
+| `POPFILE_IMAP_MOVE` | `1` | Move classified messages: `0` or `1` |
+| `POPFILE_IMAP_FOLDER_PREFIX` | — | Optional prefix for bucket folder names |
+| `POPFILE_IMAP_INTERVAL` | `60` | Seconds between checks |
+
+### SMTP proxy
+
+Classifies outgoing mail. Point your client's outgoing server at `127.0.0.1:1025`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POPFILE_SMTP_SERVER` | *(disabled)* | Upstream hostname — required to enable |
+| `POPFILE_SMTP_SERVER_PORT` | `25` | Upstream port |
+| `POPFILE_SMTP_TLS` | `0` | TLS to upstream |
+| `POPFILE_SMTP_PORT` | `1025` | Proxy listen port |
+
+### NNTP proxy
+
+Classifies Usenet articles. Point your newsreader at `127.0.0.1:1119`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POPFILE_NNTP_SERVER` | *(disabled)* | Upstream hostname — required to enable |
+| `POPFILE_NNTP_SERVER_PORT` | `119` | Upstream port |
+| `POPFILE_NNTP_TLS` | `0` | TLS to upstream |
+| `POPFILE_NNTP_PORT` | `1119` | Proxy listen port |
+
+## All environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POPFILE_USER_DIR` | `./` | Working directory — `popfile.db`, `logs/`, cache |
+| `POPFILE_UI_PORT` | `8080` | Web UI port |
+| `POPFILE_POP3_PORT` | `1110` | POP3 proxy port |
+| `POPFILE_POP3S_PORT` | `1995` | POP3S proxy port |
+| `POPFILE_SMTP_*` | see above | SMTP proxy (disabled unless server is set) |
+| `POPFILE_NNTP_*` | see above | NNTP proxy (disabled unless server is set) |
+| `POPFILE_IMAP_*` | see above | IMAP watcher (disabled unless server is set) |
+
+All settings are also editable in the web UI under **Settings** and persisted in `popfile.cfg`.
+
+## Data files
+
+| Path | Description |
+|------|-------------|
+| `popfile.cfg` | Configuration (auto-created on first run) |
+| `popfile.db` | SQLite database — words, buckets, history, users |
+| `logs/` | Hourly log files |
+| `training/` | Drop `.eml` files here for bulk import |
+
+These are excluded from git (see `.gitignore`).
+
+## Multi-user mode
+
+Each user has isolated buckets, training data, magnets, and history. Admin users manage accounts at **Users** in the web UI.
+
+Passwords are hashed with PBKDF2-SHA256 (100 000 iterations). Existing plaintext passwords are migrated automatically on first login.
+
+## Magnets
+
+Magnets are explicit rules that bypass Bayes and assign a message directly to a bucket. Useful for mailing lists, known senders, etc. Configure them under **Magnets**. Supported fields: `from`, `to`, `subject`, `cc`.
+
+## Development
+
+```bash
+deno task test      # run all 193 tests
+deno task start     # start the server
+```
+
+## Architecture
+
+Every subsystem extends an abstract `Module` base class. A `Loader` boots all modules through ordered run levels and then drives a `service()` loop until SIGINT/SIGTERM.
+
+| Level | Module(s) | Notes |
+|-------|-----------|-------|
+| 0 | `Configuration`, `MessageQueue` | Config + intra-process event bus |
+| 1 | `Logger` | File logging + hourly `TICKD` events |
+| 2 | `Database` | SQLite via `@db/sqlite`, WAL mode |
+| 3 | `Bayes` | Classifier, sessions, user management |
+| 4 | Proxies / `IMAPService` | POP3, POP3S, SMTP, NNTP, IMAP |
+| 5 | `UIServer` | Web UI (`Deno.serve`) |
+
+Classifier pipeline: MIME tokenisation → magnet check → log-probability scoring per bucket → confidence threshold (`unclassified_weight`) → `X-Text-Classification` injection.
+
+## Origin
+
+TypeScript/Deno rewrite of the original [POPFile](http://getpopfile.org/) by John Graham-Cumming. The Naive Bayes algorithm and SQLite schema (v9) are faithful to the original; the proxy infrastructure, web UI, and tooling are written from scratch.

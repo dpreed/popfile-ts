@@ -184,6 +184,9 @@ export class UIServer extends Module {
         return this.#expireSession(req, session);
       }
 
+      // Extend expiry on every authenticated request (rolling window)
+      bayes.touchSession(session);
+
       const isAdmin = bayes.isAdmin(session);
 
       // API routes (JSON)
@@ -1256,8 +1259,13 @@ export class UIServer extends Module {
             hint: "Higher = more messages fall through as unclassified (default 100)" },
           { key: "GLOBAL_message_cutoff", label: "Message size cutoff (chars)", type: "number",
             hint: "Body text beyond this limit is ignored (default 100000)" },
+        ],
+      },
+      {
+        title: "Security",
+        fields: [
           { key: "GLOBAL_session_timeout", label: "Session timeout (seconds)", type: "number",
-            hint: "How long a non-admin session stays valid (default 1800)" },
+            hint: "Idle sessions expire after this many seconds; activity resets the timer (default 1800)" },
         ],
       },
       {
