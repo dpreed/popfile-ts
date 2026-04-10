@@ -130,11 +130,42 @@ All settings are also editable in the web UI under **Settings** and persisted in
 
 These are excluded from git (see `.gitignore`).
 
+## Docker
+
+```bash
+# Build and start (data stored in ./data)
+docker compose up -d
+
+# Or build and run manually
+docker build -t popfile-ts .
+docker run -d -p 8080:8080 -p 1110:1110 -p 1995:1995 \
+  -v /path/to/data:/data popfile-ts
+```
+
+Open **http://localhost:8080** after startup.
+
+To enable HTTPS, place `cert.pem` and `key.pem` in the data directory, then enable TLS in **Settings → Security → Enable HTTPS** and restart. The session cookie gains the `Secure` flag automatically. For a self-signed certificate:
+
+```bash
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+  -days 365 -nodes -subj "/CN=localhost"
+```
+
+When running behind a reverse proxy (nginx, Caddy, Traefik), enable **Trust X-Forwarded-For** in **Settings → Security** so login rate-limiting uses the real client IP.
+
 ## Multi-user mode
 
-Each user has isolated buckets, training data, magnets, and history. Admin users manage accounts at **Users** in the web UI.
+Each user has isolated buckets, training data, magnets, and history. Admin users manage accounts and all settings at **Users** and **Settings** in the web UI.
 
 Passwords are hashed with PBKDF2-SHA256 (100 000 iterations). Existing plaintext passwords are migrated automatically on first login.
+
+## Security
+
+- CSRF protection on all forms including the login page
+- Brute-force protection: 10 failed logins locks an IP for 15 minutes
+- Rolling session timeout (default 30 minutes, configurable in Settings)
+- Security headers on all responses: `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`
+- `Secure` cookie flag enabled automatically when HTTPS is on
 
 ## Magnets
 
@@ -143,7 +174,7 @@ Magnets are explicit rules that bypass Bayes and assign a message directly to a 
 ## Development
 
 ```bash
-deno task test      # run all 193 tests
+deno task test      # run all 196 tests
 deno task start     # start the server
 ```
 
