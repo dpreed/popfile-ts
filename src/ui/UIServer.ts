@@ -32,8 +32,6 @@ export class UIServer extends Module {
   #server: Deno.HttpServer | null = null;
   /** Maps random UI cookie token → Bayes session key. */
   #browserSessions: Map<string, string> = new Map();
-  /** Temp .eml files written for uploaded classify requests; deleted on stop(). */
-  #tmpFiles: Set<string> = new Set();
 
   constructor() {
     super();
@@ -49,6 +47,22 @@ export class UIServer extends Module {
 
   override start(): LifecycleResult {
     if (this.config_("enabled") === "0") return LifecycleResult.Skip;
+
+    // Ensure classify-cache dir exists and purge entries older than 24 h
+    try {
+      const cacheDir = this.#cacheDir();
+      Deno.mkdirSync(cacheDir, { recursive: true });
+      const cutoff = Date.now() - 86_400_000;
+      for (const entry of Deno.readDirSync(cacheDir)) {
+        if (!entry.isFile) continue;
+        try {
+          const info = Deno.statSync(`${cacheDir}/${entry.name}`);
+          if ((info.mtime?.getTime() ?? 0) < cutoff) {
+            Deno.removeSync(`${cacheDir}/${entry.name}`);
+          }
+        } catch { /* ok */ }
+      }
+    } catch { /* non-fatal */ }
 
     const port = parseInt(this.config_("port"), 10);
     const hostname = this.config_("local") === "1" ? "127.0.0.1" : "0.0.0.0";
@@ -68,12 +82,35 @@ export class UIServer extends Module {
       try { bayes.releaseSessionKey(bayesSession); } catch { /* ok */ }
     }
     this.#browserSessions.clear();
-    // Delete any temp files created for uploaded classify requests
-    for (const p of this.#tmpFiles) {
-      try { Deno.removeSync(p); } catch { /* ok */ }
-    }
-    this.#tmpFiles.clear();
     super.stop();
+  }
+
+  /** Path to the directory where uploaded .eml files are cached. */
+  #cacheDir(): string {
+    return this.configuration_().getUserPath("classify-cache");
+  }
+
+  /**
+   * Save uploaded bytes to the classify-cache and return a UUID for lookup.
+   * The file is named {uuid}.eml under the cache directory.
+   */
+  async #saveToCache(bytes: Uint8Array): Promise<string> {
+    const id = crypto.randomUUID();
+    const cacheDir = this.#cacheDir();
+    Deno.mkdirSync(cacheDir, { recursive: true });
+    await Deno.writeFile(`${cacheDir}/${id}.eml`, bytes);
+    return id;
+  }
+
+  /**
+   * Resolve a cache ID to an absolute file path.
+   * Returns null if the ID is invalid or the file does not exist.
+   */
+  #resolveCacheId(id: string): string | null {
+    // UUID format only — reject anything with path separators
+    if (!/^[0-9a-f-]{36}$/.test(id)) return null;
+    const path = `${this.#cacheDir()}/${id}.eml`;
+    try { Deno.statSync(path); return path; } catch { return null; }
   }
 
   /** Returns the actual bound port (useful when configured with port 0). */
@@ -151,6 +188,7 @@ export class UIServer extends Module {
       if (path === "/history/retrain" && req.method === "POST") return await this.#doHistoryRetrain(req, bayes, session);
       if (path === "/stats" && req.method === "GET") return this.#pageStats(bayes, session);
       if (path === "/wordscores" && req.method === "GET") return this.#pageWordScores(bayes, url, session);
+      if (path === "/wordscores" && req.method === "POST") return await this.#doWordScores(req, bayes, session);
       if (path === "/settings" && req.method === "GET") return this.#pageSettings(bayes, session);
       if (path === "/settings" && req.method === "POST") return await this.#doSettings(req, bayes, session);
 
@@ -512,14 +550,16 @@ export class UIServer extends Module {
 
     // Resolve uploaded file or legacy server-path field
     let filePath: string | null = null;
-    let isTmp = false;
+    let cacheId: string | null = null;
     const upload = form.get("upload");
     if (upload instanceof File) {
       const bytes = new Uint8Array(await upload.arrayBuffer());
-      filePath = await Deno.makeTempFile({ suffix: ".eml" });
-      await Deno.writeFile(filePath, bytes);
-      this.#tmpFiles.add(filePath);
-      isTmp = true;
+      try {
+        cacheId = await this.#saveToCache(bytes);
+        filePath = this.#resolveCacheId(cacheId);
+      } catch (e) {
+        return this.#pageClassify(bayes, session, { error: `Error saving upload: ${String(e)}` });
+      }
     } else {
       filePath = (form.get("file") as string | null)?.trim() ?? null;
     }
@@ -537,7 +577,11 @@ export class UIServer extends Module {
         .map((b) => `<option value="${esc(b)}"${b === result.bucket ? " selected" : ""}>${esc(b)}</option>`)
         .join("");
       const resultColor = colors.get(result.bucket) ?? "black";
-      const wordScoresLink = `<a href="/wordscores?file=${encodeURIComponent(filePath)}" style="font-size:.85rem">Show word scores →</a>`;
+      // Word scores link: use cache ID for uploads so the link survives server restarts
+      const wsParam = cacheId
+        ? `id=${encodeURIComponent(cacheId)}`
+        : `file=${encodeURIComponent(filePath)}`;
+      const wordScoresLink = `<a href="/wordscores?${wsParam}" style="font-size:.85rem">Show word scores →</a>`;
       const trainForm = buckets.length > 0 ? `
         <div class="train-correction">
           <p>Was this wrong? Train as:</p>
@@ -561,10 +605,6 @@ export class UIServer extends Module {
         </div>`;
       return this.#pageClassify(bayes, session, { result: resultHtml });
     } catch (e) {
-      if (isTmp && filePath) {
-        this.#tmpFiles.delete(filePath);
-        await Deno.remove(filePath).catch(() => {});
-      }
       return this.#pageClassify(bayes, session, { error: `Error: ${String(e)}` });
     }
   }
@@ -988,24 +1028,28 @@ export class UIServer extends Module {
   // Word scores page
   // -------------------------------------------------------------------------
 
-  #pageWordScores(bayes: Bayes, url: URL, session: string): Response {
-    const file = url.searchParams.get("file")?.trim() ?? "";
+  #pageWordScores(bayes: Bayes, url: URL, session: string, opts?: { error?: string }): Response {
     const buckets = bayes.getBuckets(session);
     const colors  = bayes.getBucketColors(session);
 
-    let resultHtml = "";
-    if (file) {
-      try {
-        const result = bayes.classifyWithWordScores(session, file);
-        const resultColor = colors.get(result.bucket) ?? "black";
+    // Resolve file: ?id=<uuid> (cached upload) or ?file=<path> (server path)
+    const cacheId = url.searchParams.get("id")?.trim() ?? "";
+    const filePath = cacheId
+      ? this.#resolveCacheId(cacheId)
+      : (url.searchParams.get("file")?.trim() || null);
 
+    let resultHtml = "";
+    if (cacheId && !filePath) {
+      resultHtml = `<div class="error">This file is no longer available (it may have expired). Please re-upload below.</div>`;
+    } else if (filePath) {
+      try {
+        const result = bayes.classifyWithWordScores(session, filePath);
+        const resultColor = colors.get(result.bucket) ?? "black";
         const scoreRows = [...result.scores.entries()]
           .sort((a, b) => b[1] - a[1])
           .map(([b, s]) => `<tr><td>${dot(colors.get(b) ?? "black")}${esc(b)}</td><td>${(s * 100).toFixed(2)}%</td></tr>`)
           .join("");
-
         const wordRows = this.#renderWordRows(result.wordScores, buckets, colors);
-
         resultHtml = `
           <div class="result" style="margin-bottom:24px">
             <h3>Classification: ${dot(resultColor)}<strong>${esc(result.bucket)}</strong>
@@ -1032,15 +1076,38 @@ export class UIServer extends Module {
       }
     }
 
+    const notice = opts?.error ? `<div class="error" style="margin-bottom:16px">${esc(opts.error)}</div>` : "";
+
     const body = `
       <h2>Word scores</h2>
       <p>Shows which words most influenced the classification of a message.</p>
-      <form method="GET" action="/wordscores" class="inline-form">
-        <input type="text" name="file" value="${esc(file)}" placeholder="/path/to/message.eml" style="width:400px" required>
-        <button class="btn-primary">Analyse</button>
+      ${notice}
+      <form method="POST" action="/wordscores" enctype="multipart/form-data">
+        <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
+          <label>Message file (.eml):
+            <input type="file" name="upload" accept=".eml,message/rfc822" required
+              style="padding:6px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;background:#fff">
+          </label>
+          <button class="btn-primary" style="align-self:flex-start">Analyse</button>
+        </div>
       </form>
       ${resultHtml}`;
     return this.#htmlPage("Word scores", body, bayes, session);
+  }
+
+  async #doWordScores(req: Request, bayes: Bayes, session: string): Promise<Response> {
+    const form = await req.formData();
+    const upload = form.get("upload");
+    if (!(upload instanceof File)) {
+      return this.#pageWordScores(bayes, new URL(req.url), session, { error: "No file uploaded." });
+    }
+    try {
+      const bytes = new Uint8Array(await upload.arrayBuffer());
+      const id = await this.#saveToCache(bytes);
+      return Response.redirect(new URL(`/wordscores?id=${encodeURIComponent(id)}`, req.url), 303);
+    } catch (e) {
+      return this.#pageWordScores(bayes, new URL(req.url), session, { error: `Error: ${String(e)}` });
+    }
   }
 
   #renderWordRows(

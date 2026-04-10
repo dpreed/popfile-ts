@@ -453,13 +453,90 @@ Deno.test("UIServer: GET /settings returns 200 HTML", async () => {
   } finally { await cleanup(); }
 });
 
-Deno.test("UIServer: GET /wordscores returns 200 HTML", async () => {
+Deno.test("UIServer: GET /wordscores shows file upload form", async () => {
   const { baseUrl, cookie, cleanup } = await makeUIStack();
   try {
     const res = await get(baseUrl, "/wordscores", cookie);
     assertEquals(res.status, 200);
     const body = await res.text();
-    assert(body.length > 0);
+    assert(body.includes('type="file"'), "Expected file upload input");
+    assert(body.includes('enctype="multipart/form-data"'), "Expected multipart form");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /wordscores upload redirects to ?id=", async () => {
+  const { baseUrl, cookie, cleanup } = await makeUIStack();
+  try {
+    const formData = new FormData();
+    formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
+    const res = await fetch(`${baseUrl}/wordscores`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Cookie": cookie },
+      body: formData,
+    });
+    assert(res.status === 302 || res.status === 303, `Expected redirect, got ${res.status}`);
+    const location = res.headers.get("location") ?? "";
+    assert(location.includes("?id="), `Expected ?id= in redirect, got: ${location}`);
+    await res.body?.cancel();
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /wordscores?id= resolves cached file and shows analysis", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    bayes.createBucket(session, "spam");
+
+    // Upload via POST to get a cache ID
+    const formData = new FormData();
+    formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
+    const postRes = await fetch(`${baseUrl}/wordscores`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Cookie": cookie },
+      body: formData,
+    });
+    const location = postRes.headers.get("location") ?? "";
+    await postRes.body?.cancel();
+    assert(location.includes("?id="), "Expected redirect with cache id");
+
+    // Follow the redirect to get the analysis
+    const id = new URL(location, baseUrl).searchParams.get("id") ?? "";
+    const res = await get(baseUrl, `/wordscores?id=${encodeURIComponent(id)}`, cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("Classification:"), "Expected classification result");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: GET /wordscores?id= with invalid id shows error message", async () => {
+  const { baseUrl, cookie, cleanup } = await makeUIStack();
+  try {
+    const res = await get(baseUrl, "/wordscores?id=00000000-0000-0000-0000-000000000000", cookie);
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("no longer available") || body.includes("expired"),
+      "Expected expiry message for missing cache entry");
+  } finally { await cleanup(); }
+});
+
+Deno.test("UIServer: POST /classify word scores link uses ?id= not ?file=", async () => {
+  const { baseUrl, bayes, session, cookie, cleanup } = await makeUIStack();
+  try {
+    bayes.createBucket(session, "inbox");
+    const formData = new FormData();
+    formData.append("upload", new File([SAMPLE_EML], "test.eml", { type: "message/rfc822" }));
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Cookie": cookie },
+      body: formData,
+    });
+    assertEquals(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("/wordscores?id="), "Expected word scores link with ?id=");
+    assert(!body.includes("/wordscores?file="), "Should not use ?file= for uploads");
   } finally { await cleanup(); }
 });
 
