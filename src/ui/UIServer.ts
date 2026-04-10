@@ -48,6 +48,7 @@ export class UIServer extends Module {
     this.config_("port", "8080");
     this.config_("local", "1");
     this.config_("enabled", "1");
+    this.config_("trusted_proxy", "0");
     return LifecycleResult.Ok;
   }
 
@@ -166,6 +167,13 @@ export class UIServer extends Module {
     const path = url.pathname;
     const bayes = this.getModule_<Bayes>("classifier");
 
+    // When running behind a trusted reverse proxy, prefer the leftmost address
+    // from X-Forwarded-For over the direct connection IP.
+    if (this.config_("trusted_proxy") === "1") {
+      const xff = req.headers.get("x-forwarded-for");
+      if (xff) remoteIp = xff.split(",")[0].trim() || remoteIp;
+    }
+
     try {
       // Auth routes — no session required
       if (path === "/login" && req.method === "GET") {
@@ -214,8 +222,14 @@ export class UIServer extends Module {
       if (path === "/stats" && req.method === "GET") return this.#pageStats(bayes, session);
       if (path === "/wordscores" && req.method === "GET") return this.#pageWordScores(bayes, url, session);
       if (path === "/wordscores" && req.method === "POST") return await this.#doWordScores(req, bayes, session);
-      if (path === "/settings" && req.method === "GET") return this.#pageSettings(bayes, session);
-      if (path === "/settings" && req.method === "POST") return await this.#doSettings(req, bayes, session);
+      if (path === "/settings" && req.method === "GET") {
+        if (!isAdmin) return new Response("Forbidden", { status: 403 });
+        return this.#pageSettings(bayes, session);
+      }
+      if (path === "/settings" && req.method === "POST") {
+        if (!isAdmin) return new Response("Forbidden", { status: 403 });
+        return await this.#doSettings(req, bayes, session);
+      }
 
       // Admin-only routes
       if (path === "/users" && req.method === "GET") {
@@ -237,7 +251,10 @@ export class UIServer extends Module {
       return this.#html404();
     } catch (e) {
       this.log_(0, `UI error: ${e}`);
-      return new Response(`Internal error: ${e}`, { status: 500 });
+      return new Response("Internal server error", {
+        status: 500,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
     }
   }
 
@@ -1233,6 +1250,8 @@ export class UIServer extends Module {
         fields: [
           { key: "GLOBAL_session_timeout", label: "Session timeout (seconds)", type: "number",
             hint: "Idle sessions expire after this many seconds; activity resets the timer (default 1800)" },
+          { key: "ui_trusted_proxy", label: "Trust X-Forwarded-For", type: "checkbox",
+            hint: "Enable when running behind a reverse proxy (nginx, Caddy, Traefik) so login rate-limiting uses the real client IP" },
         ],
       },
       {
@@ -1353,6 +1372,7 @@ export class UIServer extends Module {
       "classifier_unclassified_weight",
       "GLOBAL_message_cutoff",
       "GLOBAL_session_timeout",
+      "ui_trusted_proxy",
       "pop3_port", "pop3_local",
       "pop3s_port",
       "smtp_server", "smtp_server_port", "smtp_tls", "smtp_port", "smtp_local",
@@ -1364,6 +1384,7 @@ export class UIServer extends Module {
     ];
 
     const checkboxKeys = new Set([
+      "ui_trusted_proxy",
       "pop3_local", "smtp_tls", "smtp_local", "nntp_tls",
       "imap_tls", "imap_move", "ui_local",
     ]);
@@ -1483,7 +1504,14 @@ export class UIServer extends Module {
   </script>
 </body>
 </html>`;
-    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    return new Response(html, {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "SAMEORIGIN",
+        "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+      },
+    });
   }
 }
 
