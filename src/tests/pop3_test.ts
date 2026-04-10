@@ -1,4 +1,4 @@
-// Copyright (c) 2025 David P. Reed. MIT License.
+// Copyright (c) 2026 David P. Reed. MIT License.
 /**
  * tests/pop3_test.ts — End-to-end tests for POP3Proxy.
  *

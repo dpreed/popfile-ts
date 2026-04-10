@@ -1,4 +1,4 @@
-// Copyright (c) 2025 David P. Reed. MIT License.
+// Copyright (c) 2026 David P. Reed. MIT License.
 /**
  * POP3Proxy.ts — POP3 proxy with inline Bayes classification.
  *
