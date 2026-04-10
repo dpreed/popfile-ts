@@ -70,6 +70,12 @@ export class SMTPProxy extends Module {
     super.stop();
   }
 
+  /** Returns the actual bound port (useful when configured with port 0). */
+  getListenPort(): number {
+    const addr = this.#listener?.addr as Deno.NetAddr | undefined;
+    return addr?.port ?? parseInt(this.config_("port"), 10);
+  }
+
   override service(): boolean {
     return this.alive_;
   }

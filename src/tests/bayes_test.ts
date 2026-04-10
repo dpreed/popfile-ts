@@ -817,3 +817,162 @@ Deno.test("Bayes: classifyWithWordScores — result matches classify", async () 
     assertEquals(r2.magnetUsed, r1.magnetUsed);
   } finally { await Deno.remove(f); cleanup(); }
 });
+
+// ---------------------------------------------------------------------------
+// User management
+// ---------------------------------------------------------------------------
+
+Deno.test("Bayes: loginUser returns session key for valid admin credentials", async () => {
+  const { bayes, cleanup } = await makeStack();
+  try {
+    const key = bayes.loginUser("admin", "");
+    assert(key !== null, "Expected a session key");
+    // Key should work as a valid session
+    assert(Array.isArray(bayes.getBuckets(key!)));
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: loginUser returns null for wrong password", async () => {
+  const { bayes, cleanup } = await makeStack();
+  try {
+    const key = bayes.loginUser("admin", "wrongpassword");
+    assertEquals(key, null);
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: loginUser returns null for nonexistent user", async () => {
+  const { bayes, cleanup } = await makeStack();
+  try {
+    const key = bayes.loginUser("nobody", "");
+    assertEquals(key, null);
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: isAdmin returns true for admin session", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    assert(bayes.isAdmin(session));
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: isAdmin returns false for non-admin session", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "alice", "pass");
+    const aliceKey = bayes.loginUser("alice", "pass");
+    assert(aliceKey !== null);
+    assert(!bayes.isAdmin(aliceKey!));
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: getUsername returns correct name for session", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    assertEquals(bayes.getUsername(session), "admin");
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: getUsername returns null for invalid session", async () => {
+  const { bayes, cleanup } = await makeStack();
+  try {
+    assertEquals(bayes.getUsername("bogus"), null);
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: listUsers includes admin", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    const users = bayes.listUsers(session);
+    assert(users.some((u) => u.name === "admin" && u.isAdmin));
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: createUserAccount adds a new user", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "bob", "secret");
+    const users = bayes.listUsers(session);
+    assert(users.some((u) => u.name === "bob" && !u.isAdmin));
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: createUserAccount requires admin session", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "alice", "pass");
+    const aliceKey = bayes.loginUser("alice", "pass")!;
+    assertThrows(
+      () => bayes.createUserAccount(aliceKey, "charlie", "pass"),
+      Error, "Admin access required",
+    );
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: new user can log in with correct password", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "carol", "mypass");
+    const key = bayes.loginUser("carol", "mypass");
+    assert(key !== null);
+    assert(Array.isArray(bayes.getBuckets(key!)));
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: deleteUserAccount removes the user", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "dave", "pass");
+    bayes.deleteUserAccount(session, "dave");
+    const users = bayes.listUsers(session);
+    assert(!users.some((u) => u.name === "dave"));
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: deleteUserAccount cannot delete admin", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    assertThrows(
+      () => bayes.deleteUserAccount(session, "admin"),
+      Error, "Cannot delete admin user",
+    );
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: deleteUserAccount requires admin session", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "eve", "pass");
+    const eveKey = bayes.loginUser("eve", "pass")!;
+    assertThrows(
+      () => bayes.deleteUserAccount(eveKey, "eve"),
+      Error, "Admin access required",
+    );
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: setPassword updates login credentials", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "frank", "oldpass");
+    const key = bayes.loginUser("frank", "oldpass")!;
+    bayes.setPassword(key, "newpass");
+    assertEquals(bayes.loginUser("frank", "oldpass"), null);
+    assert(bayes.loginUser("frank", "newpass") !== null);
+  } finally { cleanup(); }
+});
+
+Deno.test("Bayes: user data is isolated — buckets not visible across users", async () => {
+  const { bayes, session, cleanup } = await makeStack();
+  try {
+    bayes.createUserAccount(session, "grace", "pass");
+    const graceKey = bayes.loginUser("grace", "pass")!;
+
+    bayes.createBucket(session, "admin-bucket");
+    bayes.createBucket(graceKey, "grace-bucket");
+
+    assert(bayes.getBuckets(session).includes("admin-bucket"));
+    assert(!bayes.getBuckets(session).includes("grace-bucket"));
+    assert(bayes.getBuckets(graceKey).includes("grace-bucket"));
+    assert(!bayes.getBuckets(graceKey).includes("admin-bucket"));
+  } finally { cleanup(); }
+});

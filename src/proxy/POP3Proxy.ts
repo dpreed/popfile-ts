@@ -36,6 +36,7 @@ export class POP3Proxy extends Module {
     this.config_("welcome_string", "POP3 POPFile proxy ready");
     this.config_("tls_upstream", "0");
     this.config_("upstream_port", "110");
+    this.config_("tls_ca_cert", ""); // path to extra CA cert PEM for upstream TLS
     return LifecycleResult.Ok;
   }
 
@@ -65,6 +66,12 @@ export class POP3Proxy extends Module {
     super.stop();
   }
 
+  /** Returns the actual bound port (useful when configured with port 0). */
+  getListenPort(): number {
+    const addr = this.#listener?.addr as Deno.NetAddr | undefined;
+    return addr?.port ?? parseInt(this.config_("port"), 10);
+  }
+
   override service(): boolean {
     return this.alive_;
   }
@@ -84,10 +91,6 @@ export class POP3Proxy extends Module {
 
   async #handleClient(client: Deno.Conn): Promise<void> {
     this.log_(1, "New POP3 client connection");
-    const clientWriter = new WritableStreamDefaultWriter(
-      client.writable.getWriter().releaseLock() as unknown as WritableStream
-    );
-    // Use a simpler approach with raw read/write
     await this.#pop3Session(client);
     try { client.close(); } catch { /* already closed */ }
   }
@@ -134,9 +137,13 @@ export class POP3Proxy extends Module {
 
           // Connect to real server
           try {
-            mail = useTls
-              ? await Deno.connectTls({ hostname: host, port })
-              : await Deno.connect({ hostname: host, port });
+            if (useTls) {
+              const caPath = this.config_("tls_ca_cert");
+              const caCerts = caPath ? [Deno.readTextFileSync(caPath)] : undefined;
+              mail = await Deno.connectTls({ hostname: host, port, caCerts });
+            } else {
+              mail = await Deno.connect({ hostname: host, port });
+            }
             // Read server banner
             const serverReader = this.#makeLineReader(mail);
             const banner = await serverReader();

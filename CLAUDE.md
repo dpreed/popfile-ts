@@ -60,7 +60,16 @@ Modules access siblings through typed protected methods: `mq_()`, `configuration
 |----------|---------|-------------|
 | `POPFILE_USER_DIR` | `./` | Working directory for db, logs, messages |
 | `POPFILE_POP3_PORT` | `1110` | POP3 proxy listen port |
+| `POPFILE_POP3S_PORT` | `1995` | POP3S proxy listen port |
 | `POPFILE_UI_PORT` | `8080` | Web UI listen port |
+| `POPFILE_SMTP_SERVER` | *(empty)* | SMTP upstream hostname — required to enable |
+| `POPFILE_SMTP_SERVER_PORT` | `25` | SMTP upstream port |
+| `POPFILE_SMTP_TLS` | `0` | SMTP upstream TLS: 0 or 1 |
+| `POPFILE_SMTP_PORT` | `1025` | SMTP proxy listen port |
+| `POPFILE_NNTP_SERVER` | *(empty)* | NNTP upstream hostname — required to enable |
+| `POPFILE_NNTP_SERVER_PORT` | `119` | NNTP upstream port |
+| `POPFILE_NNTP_TLS` | `0` | NNTP upstream TLS: 0 or 1 |
+| `POPFILE_NNTP_PORT` | `1119` | NNTP proxy listen port |
 
 ### IMAP service
 
@@ -100,6 +109,27 @@ Listens on port **1025** (or `smtp_port`). Relays all SMTP commands to a pre-con
 
 Configure your mail client to use `127.0.0.1:1025` as its outgoing SMTP server.
 
+### NNTP proxy
+
+Listens on port **1119** (or `nntp_port`). Relays all NNTP commands to a pre-configured upstream news server, intercepting `ARTICLE` and `HEAD` responses to classify and inject `X-Text-Classification`.
+
+| Config key | Default | Description |
+|-----------|---------|-------------|
+| `nntp_server` | *(empty — disabled)* | Upstream NNTP hostname (required to enable) |
+| `nntp_server_port` | `119` | Upstream port |
+| `nntp_tls` | `0` | Use TLS for upstream connection |
+
+Configure your newsreader to use `127.0.0.1:1119` as its NNTP server.
+
+### Multi-user web UI
+
+The web UI requires login. The default admin account has username **admin** and a blank password. Admin users can:
+
+- Create and delete user accounts via `/users`
+- Change their own password via `/users`
+
+Each user's buckets, history, magnets, and training data are isolated. Non-admin users cannot access `/users`. The admin session cookie is named `popfile_session`.
+
 ### Not yet ported
 
-`Proxy::NNTP`, `UI::XMLRPC`, multi-user UI, CJK tokenisation. Each maps 1:1 to a Perl module and can be added without touching core infrastructure.
+`UI::XMLRPC`. Each maps 1:1 to a Perl module and can be added without touching core infrastructure.

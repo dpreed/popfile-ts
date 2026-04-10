@@ -291,6 +291,11 @@ export class IMAPService extends Module {
   // Classification pass
   // -------------------------------------------------------------------------
 
+  /** Trigger an immediate classification pass, bypassing the interval timer. */
+  async poll(): Promise<void> {
+    await this.#checkAndClassify();
+  }
+
   async #checkAndClassify(): Promise<void> {
     const server   = this.config_("server");
     const port     = parseInt(this.config_("port"));

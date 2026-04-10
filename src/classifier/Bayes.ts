@@ -149,6 +149,66 @@ export class Bayes extends Module {
     return key;
   }
 
+  /**
+   * Authenticate directly against the users table (no accounts JOIN).
+   * Returns a session key on success, null on failure.
+   */
+  loginUser(username: string, password: string): string | null {
+    const db = this.db_();
+    const row = db.prepare(
+      "SELECT id FROM users WHERE name=? AND password=?"
+    ).value<[number]>(username, password);
+    if (!row) return null;
+    const userId = row[0];
+    const key = this.#generateSessionKey();
+    const timeout = parseInt(this.globalConfig_("session_timeout"), 10) * 1000;
+    this.#sessions.set(key, { userId, expires: Date.now() + timeout });
+    return key;
+  }
+
+  /** Returns true if the session belongs to the admin user (id=1). */
+  isAdmin(sessionKey: string): boolean {
+    const userId = this.#validSession(sessionKey);
+    return userId === 1;
+  }
+
+  /** Returns the username for the session, or null if invalid. */
+  getUsername(sessionKey: string): string | null {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) return null;
+    const row = this.db_().prepare("SELECT name FROM users WHERE id=?").value<[string]>(userId);
+    return row?.[0] ?? null;
+  }
+
+  /** List all users (admin only). */
+  listUsers(adminSession: string): Array<{ name: string; isAdmin: boolean }> {
+    if (!this.isAdmin(adminSession)) throw new Error("Admin access required");
+    const rows = this.db_().prepare(
+      "SELECT id, name FROM users ORDER BY id"
+    ).values<[number, string]>();
+    return rows.map(([id, name]) => ({ name, isAdmin: id === 1 }));
+  }
+
+  /** Create a new user (admin only). */
+  createUserAccount(adminSession: string, username: string, password: string): void {
+    if (!this.isAdmin(adminSession)) throw new Error("Admin access required");
+    this.db_().exec("INSERT INTO users (name, password) VALUES (?,?)", username, password);
+  }
+
+  /** Delete a user (admin only; cannot delete admin). */
+  deleteUserAccount(adminSession: string, username: string): void {
+    if (!this.isAdmin(adminSession)) throw new Error("Admin access required");
+    if (username === "admin") throw new Error("Cannot delete admin user");
+    this.db_().exec("DELETE FROM users WHERE name=? AND id != 1", username);
+  }
+
+  /** Change a user's own password. */
+  setPassword(sessionKey: string, newPassword: string): void {
+    const userId = this.#validSession(sessionKey);
+    if (userId === null) throw new Error("Invalid session key");
+    this.db_().exec("UPDATE users SET password=? WHERE id=?", newPassword, userId);
+  }
+
   getAdministratorSessionKey(): string {
     // Single-user mode: create/return admin session without auth
     const db = this.db_();

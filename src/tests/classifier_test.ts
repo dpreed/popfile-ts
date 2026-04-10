@@ -235,3 +235,58 @@ Deno.test("MailParser: parse from file", async () => {
     await Deno.remove(tmpFile);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Base64 decoding
+// ---------------------------------------------------------------------------
+
+Deno.test("MailParser: decodes base64 body", () => {
+  // "hello world from base64" base64-encoded
+  const raw = [
+    "Content-Transfer-Encoding: base64",
+    "",
+    "aGVsbG8gd29ybGQgZnJvbSBiYXNlNjQ=",
+  ].join("\r\n");
+
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+  assert(words.has("hello"), "should decode 'hello' from base64");
+  assert(words.has("world"), "should decode 'world' from base64");
+  assert(words.has("base64"), "should decode 'base64' from base64");
+});
+
+Deno.test("MailParser: decodes base64 body split across multiple lines", () => {
+  // "Buy cheap discount pharmaceuticals online now free shipping" split over two lines
+  const raw = [
+    "Content-Transfer-Encoding: base64",
+    "",
+    "QnV5IGNoZWFwIGRpc2NvdW50IHBoYXJtYWNldXRpY2FscyBvbmxpbmUgbm93IGZyZWUgc2hpcHBp",
+    "bmc=",
+  ].join("\r\n");
+
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+  assert(words.has("buy") || words.has("cheap"), "should extract words from multi-line base64");
+  assert(words.has("pharmaceuticals") || words.has("online"), "should extract words from multi-line base64");
+});
+
+Deno.test("MailParser: decodes base64 in multipart message", () => {
+  const boundary = "BNDRY42";
+  // "click here to purchase amazing offer" base64-encoded
+  const b64body = "Y2xpY2sgaGVyZSB0byBwdXJjaGFzZSBhbWF6aW5nIG9mZmVy";
+  const raw = [
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/plain",
+    "Content-Transfer-Encoding: base64",
+    "",
+    b64body,
+    `--${boundary}--`,
+  ].join("\r\n");
+
+  const parser = new MailParser();
+  const { words } = parser.parse(raw);
+  assert(words.has("click") || words.has("purchase"), "should decode base64 in multipart part");
+  assert(words.has("amazing") || words.has("offer"), "should decode base64 in multipart part");
+});

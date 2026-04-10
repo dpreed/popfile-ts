@@ -1,6 +1,7 @@
 {
   "name": "popfile",
   "version": "1.0.0",
+  "exports": "./src/main.ts",
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi src/main.ts",
     "classify": "deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi src/classify.ts",
